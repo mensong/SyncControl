@@ -1,0 +1,14 @@
+.vs/
+.artifacts/
+
+# Build outputs
+build/
+bin/
+obj/
+out/
+
+# Build intermediates
+*.obj
+
+# Local logs
+*.log
