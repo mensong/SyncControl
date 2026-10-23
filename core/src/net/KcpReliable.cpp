@@ -58,6 +58,10 @@ void KcpReliable::update(IUINT32 currentMs) {
     }
 }
 
+void KcpReliable::flush() {
+    update(static_cast<IUINT32>(GetTickCount64() & 0xFFFFFFFFU));
+}
+
 void KcpReliable::setParameters(const KcpParameters& parameters) {
     if (m_kcp == nullptr) {
         return;

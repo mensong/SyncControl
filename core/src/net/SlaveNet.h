@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -68,7 +69,7 @@ private:
     void handleFrame(Peer& peer, const Message& message, uint64_t nowMs);
     void handleInputMessage(const Message& message);
     void handleMouseMove(Peer* peer, const Message& message);
-    void sendKcpFrame(Peer& peer, const Message& message);
+    bool sendKcpFrame(Peer& peer, const Message& message);
     void sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files);
     void sendHandshakeResponse(Peer& peer);
     void sendHeartbeat(Peer& peer);
@@ -76,6 +77,7 @@ private:
 
     UdpSocket m_socket;
     std::vector<Peer> m_peers;
+    mutable std::recursive_mutex m_networkMutex;
     InputInject m_input;
     ClipboardMonitor* m_clipboard = nullptr;
     FileTransferManager* m_fileTransfer = nullptr;

@@ -32,8 +32,11 @@ public:
         std::vector<FileEntry> files;
     };
 
+    ~ClipboardMonitor();
+
     bool start();
     void stop();
+    void clearRemoteClipboardState();
 
     // Re-reads the system clipboard into the cache; true when content changed.
     bool refresh();
@@ -56,7 +59,7 @@ private:
                                        WPARAM wParam, LPARAM lParam);
     static ClipboardMonitor* s_instance;
 
-    LRESULT handleMessage(UINT message, WPARAM wParam, LPARAM lParam);
+    LRESULT handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT handleRenderFormat(UINT format);
     bool readClipboard(Snapshot& out) const;
     bool storeIfChanged(Snapshot&& snapshot);

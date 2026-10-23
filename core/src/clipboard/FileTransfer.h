@@ -11,6 +11,7 @@
 #include <atomic>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -74,7 +75,9 @@ public:
 
 private:
     void acceptLoop();
-    void receiveSession(SOCKET socket);
+    void receiveSession(SOCKET socket, const std::atomic<bool>& cancel);
+    std::shared_ptr<std::atomic<bool>> registerActiveCancel();
+    void unregisterActiveCancel(const std::shared_ptr<std::atomic<bool>>& cancel);
     void updateStatus(bool active, const std::string& fileName, uint64_t transferred,
                       uint64_t total);
     void trackWorker(std::thread worker);
@@ -85,6 +88,8 @@ private:
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_sessionBusy{false};
 
+    std::mutex m_cancelsMutex;
+    std::vector<std::shared_ptr<std::atomic<bool>>> m_activeCancels;
     mutable std::mutex m_statusMutex;
     Status m_status;
     std::atomic<uint64_t> m_completedCount{0};

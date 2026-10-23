@@ -8,12 +8,14 @@
 #include <vector>
 #include <wchar.h>
 
+#include "core/Logger.h"
+
 namespace synccontrol {
 namespace {
 
 constexpr wchar_t kWindowClassName[] = L"SyncControlClipboardWindow";
-constexpr int kOpenRetryCount = 3;
-constexpr DWORD kOpenRetryDelayMs = 10;
+constexpr int kOpenRetryCount = 50;
+constexpr DWORD kOpenRetryDelayMs = 20;
 constexpr size_t kMaxClipboardFiles = 100000;
 constexpr int kMaxDirectoryDepth = 32;
 
@@ -51,13 +53,18 @@ std::string wideToUtf8(const std::wstring& value) {
     return wideToUtf8(value.data(), static_cast<int>(value.size()));
 }
 
-bool openClipboardWithRetry(HWND owner) {
+bool openClipboardWithRetry(HWND owner, const char* operation) {
+    DWORD lastError = 0;
     for (int attempt = 0; attempt < kOpenRetryCount; ++attempt) {
         if (OpenClipboard(owner)) {
             return true;
         }
+        lastError = GetLastError();
         Sleep(kOpenRetryDelayMs);
     }
+    Logger::write(std::string("clipboard: OpenClipboard failed, operation=") +
+                  operation + ", attempts=" + std::to_string(kOpenRetryCount) +
+                  ", win32Error=" + std::to_string(static_cast<uint32_t>(lastError)));
     return false;
 }
 
@@ -223,6 +230,10 @@ HGLOBAL allocHdrop(const std::vector<FileEntry>& files) {
 
 ClipboardMonitor* ClipboardMonitor::s_instance = nullptr;
 
+ClipboardMonitor::~ClipboardMonitor() {
+    stop();
+}
+
 bool ClipboardMonitor::start() {
     if (m_window != nullptr) {
         return true;
@@ -236,21 +247,62 @@ bool ClipboardMonitor::start() {
     windowClass.lpszClassName = kWindowClassName;
     m_classAtom = RegisterClassW(&windowClass);
     if (m_classAtom == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        Logger::write("clipboard: register window class failed, win32Error=" +
+                      std::to_string(static_cast<uint32_t>(GetLastError())));
         stop();
         return false;
     }
 
-    m_window = CreateWindowExW(0, kWindowClassName, L"SyncControlClipboard", 0,
+    const LPCWSTR className = m_classAtom != 0
+                                  ? MAKEINTRESOURCEW(m_classAtom)
+                                  : kWindowClassName;
+    SetLastError(0);
+    m_window = CreateWindowExW(0, className, L"SyncControlClipboard", 0,
                                0, 0, 0, 0, HWND_MESSAGE, nullptr, instance, nullptr);
     if (m_filesFormat == 0) {
         m_filesFormat = RegisterClipboardFormatW(L"SyncControl.Files");
     }
-    if (m_window == nullptr || !AddClipboardFormatListener(m_window)) {
+    if (m_window == nullptr) {
+        const DWORD messageWindowError = GetLastError();
+        Logger::write("clipboard: message-only window creation failed, win32Error=" +
+                      std::to_string(static_cast<uint32_t>(messageWindowError)));
+
+        // Some restricted or third-party-hooked desktops reject message-only
+        // windows. A hidden top-level owner window is equivalent for clipboard
+        // notifications and delayed rendering.
+        SetLastError(0);
+        m_window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE, className,
+                                   L"", WS_POPUP, 0, 0, 0, 0, nullptr,
+                                   nullptr, instance, nullptr);
+        if (m_window == nullptr) {
+            Logger::write("clipboard: fallback window creation failed, win32Error=" +
+                          std::to_string(static_cast<uint32_t>(GetLastError())));
+            stop();
+            return false;
+        }
+        Logger::write("clipboard: using hidden top-level fallback window");
+    }
+    if (!AddClipboardFormatListener(m_window)) {
+        Logger::write("clipboard: add clipboard listener failed, win32Error=" +
+                      std::to_string(static_cast<uint32_t>(GetLastError())));
         stop();
         return false;
     }
     refresh();
     return true;
+}
+
+void ClipboardMonitor::clearRemoteClipboardState() {
+    m_hasPendingRemoteFiles = false;
+    m_renderingFiles = false;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        m_pendingRemoteFiles.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        m_cache = {};
+    }
 }
 
 void ClipboardMonitor::stop() {
@@ -283,14 +335,15 @@ void ClipboardMonitor::stop() {
 LRESULT CALLBACK ClipboardMonitor::windowProc(HWND window, UINT message,
                                               WPARAM wParam, LPARAM lParam) {
     if (s_instance != nullptr) {
-        return s_instance->handleMessage(message, wParam, lParam);
+        return s_instance->handleMessage(window, message, wParam, lParam);
     }
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
-LRESULT ClipboardMonitor::handleMessage(UINT message, WPARAM wParam, LPARAM lParam) {
+LRESULT ClipboardMonitor::handleMessage(HWND window, UINT message,
+                                        WPARAM wParam, LPARAM lParam) {
     if (m_window == nullptr) {
-        return DefWindowProcW(nullptr, message, wParam, lParam);
+        return DefWindowProcW(window, message, wParam, lParam);
     }
     switch (message) {
         case WM_CLIPBOARDUPDATE:
@@ -303,17 +356,23 @@ LRESULT ClipboardMonitor::handleMessage(UINT message, WPARAM wParam, LPARAM lPar
         case WM_DESTROY:
             return 0;
         default:
-            return DefWindowProcW(m_window, message, wParam, lParam);
+            return DefWindowProcW(window, message, wParam, lParam);
     }
 }
 
 bool ClipboardMonitor::readClipboard(Snapshot& out) const {
     out = {};
-    if (!openClipboardWithRetry(m_window)) {
+    if (!openClipboardWithRetry(m_window, "read local clipboard")) {
         return false;
     }
 
-    if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+    if (IsClipboardFormatAvailable(CF_HDROP)) {
+        const HANDLE handle = GetClipboardData(CF_HDROP);
+        if (handle != nullptr) {
+            out.state = State::Files;
+            out.files = buildFileEntries(static_cast<HDROP>(handle));
+        }
+    } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
         const HANDLE handle = GetClipboardData(CF_UNICODETEXT);
         if (handle != nullptr) {
             const SIZE_T bytes = GlobalSize(handle);
@@ -330,14 +389,12 @@ bool ClipboardMonitor::readClipboard(Snapshot& out) const {
                 GlobalUnlock(static_cast<HGLOBAL>(handle));
             }
         }
-    } else if (IsClipboardFormatAvailable(CF_HDROP)) {
-        const HANDLE handle = GetClipboardData(CF_HDROP);
-        if (handle != nullptr) {
-            out.state = State::Files;
-            out.files = buildFileEntries(static_cast<HDROP>(handle));
-        }
     }
     CloseClipboard();
+    if (out.state == State::Files && !out.files.empty()) {
+        Logger::write("clipboard: detected local files, count=" +
+                      std::to_string(out.files.size()));
+    }
     return true;
 }
 
@@ -366,7 +423,7 @@ ClipboardMonitor::Snapshot ClipboardMonitor::snapshot() const {
 
 bool ClipboardMonitor::setTextToClipboard(const std::string& utf8) {
     const std::wstring wide = utf8ToWide(utf8);
-    if (wide.empty() || !openClipboardWithRetry(m_window)) {
+    if (wide.empty() || !openClipboardWithRetry(m_window, "write clipboard text")) {
         return false;
     }
 
@@ -394,7 +451,14 @@ bool ClipboardMonitor::setTextToClipboard(const std::string& utf8) {
 }
 
 bool ClipboardMonitor::setPendingFilesMeta(const std::vector<FileEntry>& files) {
-    if (m_window == nullptr || files.empty() || !openClipboardWithRetry(m_window)) {
+    if (m_window == nullptr || files.empty()) {
+        Logger::write("clipboard: cannot install remote file metadata, windowValid=" +
+                      std::to_string(m_window != nullptr ? 1 : 0) +
+                      ", count=" + std::to_string(files.size()));
+        return false;
+    }
+    if (!openClipboardWithRetry(m_window, "install remote file metadata")) {
+        Logger::write("clipboard: cannot open clipboard for remote file metadata");
         return false;
     }
 
@@ -405,9 +469,18 @@ bool ClipboardMonitor::setPendingFilesMeta(const std::vector<FileEntry>& files) 
             GlobalFree(metadata);
         }
         // A null handle defers CF_HDROP rendering until the paste target asks.
-        if (SetClipboardData(CF_HDROP, nullptr) != nullptr) {
+        // For delayed rendering this API returns null on success.
+        SetLastError(0);
+        const HANDLE delayedDrop = SetClipboardData(CF_HDROP, nullptr);
+        const DWORD delayedDropError = GetLastError();
+        if (delayedDrop != nullptr || delayedDropError == 0) {
             ok = true;
+        } else {
+            Logger::write("clipboard: SetClipboardData failed for delayed CF_HDROP, win32Error=" +
+                          std::to_string(static_cast<uint32_t>(delayedDropError)));
         }
+    } else {
+        Logger::write("clipboard: EmptyClipboard failed for remote file metadata");
     }
     CloseClipboard();
     if (!ok) {
@@ -427,11 +500,14 @@ bool ClipboardMonitor::setPendingFilesMeta(const std::vector<FileEntry>& files) 
         m_cache = std::move(snapshot);
     }
     rememberClipboardUpdate();
+    Logger::write("clipboard: installed remote file metadata, count=" +
+                  std::to_string(files.size()));
     return true;
 }
 
 bool ClipboardMonitor::setFilesToClipboard(const std::vector<FileEntry>& files) {
-    if (m_window == nullptr || files.empty() || !openClipboardWithRetry(m_window)) {
+    if (m_window == nullptr || files.empty() ||
+        !openClipboardWithRetry(m_window, "write downloaded files")) {
         return false;
     }
 
@@ -483,6 +559,8 @@ LRESULT ClipboardMonitor::handleRenderFormat(UINT format) {
     }
 
     m_renderingFiles = true;
+    Logger::write("clipboard: paste requested file download, count=" +
+                  std::to_string(metadata.size()));
     std::vector<FileEntry> downloaded = m_fileRequest(metadata);
     m_renderingFiles = false;
     m_hasPendingRemoteFiles = false;

@@ -30,6 +30,7 @@ public:
     int recv(uint8_t* data, size_t size);
     int input(const char* data, long size);
     void update(IUINT32 currentMs);
+    void flush();
     void setParameters(const KcpParameters& parameters);
 
 private:

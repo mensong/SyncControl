@@ -15,7 +15,7 @@ namespace {
 constexpr uint16_t kKcpConversation = 1;
 constexpr uint64_t kHandshakeRetryMs = 1000;
 constexpr uint64_t kHeartbeatIntervalMs = 1000;
-constexpr uint64_t kPeerTimeoutMs = 3000;
+constexpr uint64_t kPeerTimeoutMs = 8000;
 constexpr uint64_t kUdpWarningMs = 5000;
 
 bool sameEndpoint(const sockaddr_in& left, const sockaddr_in& right) {
@@ -97,6 +97,7 @@ bool MasterNet::start(const std::string& bindIp, const std::vector<PeerInit>& in
 }
 
 void MasterNet::stop() {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     m_running = false;
     m_pendingMouseMove = false;
     m_pendingMoveX = 0;
@@ -107,6 +108,7 @@ void MasterNet::stop() {
 }
 
 void MasterNet::reauthenticate() {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     const uint64_t nowMs = GetTickCount64();
     for (Peer& peer : m_peers) {
         resetPeer(peer, nowMs);
@@ -114,6 +116,7 @@ void MasterNet::reauthenticate() {
 }
 
 void MasterNet::remapPeerIps(const std::vector<PeerInit>& peers) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     for (const PeerInit& init : peers) {
         Peer* peer = findPeerByIp(init.ip);
         if (peer != nullptr && !init.id.empty()) {
@@ -124,6 +127,7 @@ void MasterNet::remapPeerIps(const std::vector<PeerInit>& peers) {
 }
 
 uint16_t MasterNet::peerFilePortByIp(const std::string& ip) const {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     for (const Peer& peer : m_peers) {
         if (peer.ip == ip && peer.filePort != 0) {
             return peer.filePort;
@@ -180,6 +184,7 @@ MasterNet::Peer* MasterNet::focusedPeer() {
 }
 
 MasterNet::ScreenSize MasterNet::firstConnectedScreen() const {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     for (const Peer& peer : m_peers) {
         if (peer.connected && peer.screenW > 0 && peer.screenH > 0) {
             return {true, peer.screenW, peer.screenH};
@@ -189,6 +194,7 @@ MasterNet::ScreenSize MasterNet::firstConnectedScreen() const {
 }
 
 MasterNet::ScreenSize MasterNet::peerScreenById(const std::string& id) const {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     for (const Peer& peer : m_peers) {
         if (peer.id == id) {
             if (peer.connected && peer.screenW > 0 && peer.screenH > 0) {
@@ -201,6 +207,7 @@ MasterNet::ScreenSize MasterNet::peerScreenById(const std::string& id) const {
 }
 
 bool MasterNet::hasPeer(const std::string& id) const {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     for (const Peer& peer : m_peers) {
         if (peer.id == id) {
             return true;
@@ -210,10 +217,12 @@ bool MasterNet::hasPeer(const std::string& id) const {
 }
 
 void MasterNet::setFocusedPeer(const std::string& id) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     m_focusPeerId = id;
 }
 
 void MasterNet::setKcpOverride(const KcpParameters& parameters) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     m_kcpOverride = true;
     m_kcpOverrideParameters = parameters;
     for (Peer& peer : m_peers) {
@@ -225,12 +234,14 @@ void MasterNet::setKcpOverride(const KcpParameters& parameters) {
 }
 
 void MasterNet::queueMouseMove(uint16_t x, uint16_t y) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     m_pendingMouseMove = true;
     m_pendingMoveX = x;
     m_pendingMoveY = y;
 }
 
 bool MasterNet::sendMouseButton(MouseButtonCode button, MouseAction action) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = focusedPeer();
     if (peer == nullptr) {
         return false;
@@ -239,6 +250,7 @@ bool MasterNet::sendMouseButton(MouseButtonCode button, MouseAction action) {
 }
 
 bool MasterNet::sendMouseWheel(WheelDirection direction, int16_t delta) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = focusedPeer();
     if (peer == nullptr) {
         return false;
@@ -247,6 +259,7 @@ bool MasterNet::sendMouseWheel(WheelDirection direction, int16_t delta) {
 }
 
 bool MasterNet::sendKeyEvent(bool down, uint16_t vkCode, uint16_t scanCode, bool extendedKey) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = focusedPeer();
     if (peer == nullptr) {
         return false;
@@ -256,6 +269,7 @@ bool MasterNet::sendKeyEvent(bool down, uint16_t vkCode, uint16_t scanCode, bool
 }
 
 bool MasterNet::sendSwitchIn(uint16_t x, uint16_t y) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = focusedPeer();
     if (peer == nullptr) {
         return false;
@@ -269,6 +283,7 @@ bool MasterNet::sendSwitchIn(uint16_t x, uint16_t y) {
 }
 
 bool MasterNet::sendSwitchInTo(const std::string& peerId, uint16_t x, uint16_t y) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = findPeerById(peerId);
     if (peer == nullptr || !peer->connected) {
         return false;
@@ -282,6 +297,7 @@ bool MasterNet::sendSwitchInTo(const std::string& peerId, uint16_t x, uint16_t y
 }
 
 bool MasterNet::sendSwitchOut() {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = focusedPeer();
     if (peer == nullptr) {
         return false;
@@ -291,6 +307,7 @@ bool MasterNet::sendSwitchOut() {
 }
 
 bool MasterNet::sendSwitchOutFrom(const std::string& peerId) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = findPeerById(peerId);
     if (peer == nullptr) {
         return false;
@@ -305,6 +322,7 @@ bool MasterNet::sendSwitchOutFrom(const std::string& peerId) {
 }
 
 bool MasterNet::sendClipboardTextTo(const std::string& peerId, const std::string& utf8) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = findPeerById(peerId);
     if (peer == nullptr || !peer->connected || utf8.empty() ||
         utf8.size() > 0xFFFF) {  // 协议帧长度上限 64KB
@@ -314,24 +332,47 @@ bool MasterNet::sendClipboardTextTo(const std::string& peerId, const std::string
 }
 
 bool MasterNet::sendClipboardRequestTo(const std::string& peerId, bool files) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = findPeerById(peerId);
     if (peer == nullptr || !peer->connected) {
         return false;
     }
-    return sendFrame(*peer, {MessageType::ClipboardRequest, encodeClipboardRequest(files)});
+    const bool sent = sendFrame(*peer,
+                                {MessageType::ClipboardRequest,
+                                 encodeClipboardRequest(files)});
+    if (sent && peer->kcp) {
+        peer->kcp->flush();
+    }
+    return sent;
 }
 
 bool MasterNet::sendFilesMetaTo(const std::string& peerId,
                                 const std::vector<FileEntry>& files) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = findPeerById(peerId);
     if (peer == nullptr || !peer->connected || files.empty()) {
+        Logger::write("master: cannot send clipboard files meta peer=" + peerId +
+                      ", count=" + std::to_string(files.size()));
         return false;
     }
     const std::vector<uint8_t> payload = encodeFilesMeta(files);
     if (payload.size() > 0xFFFF) {  // protocol frame length is a u16
+        Logger::write("master: clipboard files meta too large peer=" + peerId +
+                      ", bytes=" + std::to_string(payload.size()));
         return false;
     }
-    return sendFrame(*peer, {MessageType::ClipboardFilesMeta, std::move(payload)});
+    const bool sent = sendFrame(*peer,
+                                {MessageType::ClipboardFilesMeta, std::move(payload)});
+    if (sent) {
+        peer->kcp->flush();
+        Logger::write("master: sent clipboard files meta peer=" + peerId +
+                      ", count=" + std::to_string(files.size()) +
+                      ", bytes=" + std::to_string(payload.size()));
+    } else {
+        Logger::write("master: failed to send clipboard files meta peer=" + peerId +
+                      ", count=" + std::to_string(files.size()));
+    }
+    return sent;
 }
 
 void MasterNet::resetPeer(Peer& peer, uint64_t nowMs) {
@@ -400,6 +441,7 @@ void MasterNet::sendHeartbeat(Peer& peer, uint64_t nowMs) {
 }
 
 void MasterNet::poll(uint64_t nowMs) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     if (!m_running) {
         return;
     }
@@ -433,6 +475,7 @@ void MasterNet::poll(uint64_t nowMs) {
 }
 
 void MasterNet::flushPendingMove() {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     if (!m_pendingMouseMove) {
         return;
     }
@@ -568,9 +611,16 @@ void MasterNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) 
         }
         case MessageType::ClipboardFilesMeta: {
             std::vector<FileEntry> files;
-            if (decodeFilesMeta(message.payload, files) && !files.empty() &&
-                onClipboardFiles) {
-                onClipboardFiles(peer.id, files);
+            if (decodeFilesMeta(message.payload, files) && !files.empty()) {
+                if (onClipboardFiles) {
+                    Logger::write("master: received clipboard files meta peer=" +
+                                  peer.id + ", count=" + std::to_string(files.size()));
+                    onClipboardFiles(peer.id, files);
+                }
+            } else {
+                Logger::write("master: received invalid clipboard files meta peer=" +
+                              peer.id + ", bytes=" +
+                              std::to_string(message.payload.size()));
             }
             break;
         }
@@ -578,6 +628,7 @@ void MasterNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) 
             bool files = false;
             if (decodeClipboardRequest(message.payload, files) && files &&
                 onClipboardFilesRequest) {
+                Logger::write("master: received clipboard files request peer=" + peer.id);
                 onClipboardFilesRequest(peer.id, peer.ip);
             }
             break;
@@ -588,6 +639,7 @@ void MasterNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) 
 }
 
 bool MasterNet::sendFrame(Peer& peer, const Message& message) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     const std::vector<uint8_t> bytes = serializeMessage(message);
     if (routeChannel(message.type) == Channel::UdpRaw) {
         return m_socket.sendTo(peer.endpoint, bytes.data(), bytes.size());

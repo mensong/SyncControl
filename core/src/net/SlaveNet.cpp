@@ -13,7 +13,7 @@ namespace synccontrol {
 namespace {
 
 constexpr uint16_t kKcpConversation = 1;
-constexpr uint64_t kPeerTimeoutMs = 3000;
+constexpr uint64_t kPeerTimeoutMs = 8000;
 
 bool sameEndpoint(const sockaddr_in& left, const sockaddr_in& right) {
     return left.sin_family == right.sin_family &&
@@ -68,6 +68,7 @@ bool hasLocalFiles(const std::vector<FileEntry>& files) {
 }  // namespace
 
 bool SlaveNet::start(uint16_t localPort, const std::string& masterIp, uint16_t masterPort) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     if (m_running) {
         return true;
     }
@@ -88,6 +89,7 @@ bool SlaveNet::start(uint16_t localPort, const std::string& masterIp, uint16_t m
 }
 
 void SlaveNet::setKcpOverride(const KcpParameters& parameters) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     m_kcpOverride = true;
     m_kcpOverrideParameters = parameters;
     for (Peer& peer : m_peers) {
@@ -99,6 +101,7 @@ void SlaveNet::setKcpOverride(const KcpParameters& parameters) {
 }
 
 void SlaveNet::disconnectAll() {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     if (!m_peers.empty()) {
         Logger::write("slave: disconnected all masters for key re-authentication");
     }
@@ -110,6 +113,7 @@ void SlaveNet::disconnectAll() {
 }
 
 SlaveNet::MouseStats SlaveNet::mouseStats() const {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     uint64_t received = 0;
     uint64_t lost = 0;
     for (const Peer& peer : m_peers) {
@@ -120,6 +124,7 @@ SlaveNet::MouseStats SlaveNet::mouseStats() const {
 }
 
 void SlaveNet::stop() {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     m_running = false;
     m_inputActive = false;
     m_peers.clear();
@@ -171,6 +176,7 @@ void SlaveNet::removeTimedOutPeers(uint64_t nowMs) {
 }
 
 void SlaveNet::poll(uint64_t nowMs) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     if (!m_running) {
         return;
     }
@@ -330,9 +336,20 @@ void SlaveNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) {
         }
         case MessageType::ClipboardFilesMeta: {
             std::vector<FileEntry> files;
-            if (decodeFilesMeta(message.payload, files) && !files.empty() &&
-                m_clipboard != nullptr) {
-                m_clipboard->setPendingFilesMeta(files);
+            if (decodeFilesMeta(message.payload, files) && !files.empty()) {
+                if (m_clipboard != nullptr) {
+                    const bool installed = m_clipboard->setPendingFilesMeta(files);
+                    Logger::write(std::string("slave: ") +
+                                  (installed ? "installed" : "failed to install") +
+                                  " clipboard files meta, count=" +
+                                  std::to_string(files.size()) + ", bytes=" +
+                                  std::to_string(message.payload.size()));
+                } else {
+                    Logger::write("slave: clipboard monitor unavailable for files meta");
+                }
+            } else {
+                Logger::write("slave: received invalid clipboard files meta, bytes=" +
+                              std::to_string(message.payload.size()));
             }
             break;
         }
@@ -342,31 +359,61 @@ void SlaveNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) {
     }
 }
 
-void SlaveNet::sendKcpFrame(Peer& peer, const Message& message) {
+bool SlaveNet::sendKcpFrame(Peer& peer, const Message& message) {
     if (peer.kcp == nullptr) {
-        return;
+        return false;
     }
     const std::vector<uint8_t> bytes = serializeMessage(message);
-    peer.kcp->send(bytes.data(), bytes.size());
+    return peer.kcp->send(bytes.data(), bytes.size());
 }
 
 void SlaveNet::sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files) {
     const std::vector<uint8_t> payload = encodeFilesMeta(files);
     if (payload.size() > 0xFFFF) {
+        Logger::write("slave: clipboard files meta too large, bytes=" +
+                      std::to_string(payload.size()));
         return;
     }
-    sendKcpFrame(peer, {MessageType::ClipboardFilesMeta, std::move(payload)});
+    const bool sent = sendKcpFrame(peer,
+                                   {MessageType::ClipboardFilesMeta,
+                                    std::move(payload)});
+    if (sent) {
+        peer.kcp->flush();
+        Logger::write("slave: sent clipboard files meta peer=" + peer.id +
+                      ", count=" + std::to_string(files.size()) +
+                      ", bytes=" + std::to_string(payload.size()));
+    } else {
+        Logger::write("slave: failed to send clipboard files meta peer=" + peer.id);
+    }
 }
 
 std::vector<FileEntry> SlaveNet::requestClipboardFiles() {
     if (!m_running || m_fileTransfer == nullptr || m_peers.empty()) {
+        Logger::write("slave: cannot request clipboard files, running=" +
+                      std::to_string(m_running ? 1 : 0) +
+                      ", fileTransfer=" +
+                      std::to_string(m_fileTransfer != nullptr ? 1 : 0) +
+                      ", peers=" + std::to_string(m_peers.size()));
         return {};
     }
 
-    Peer& peer = m_peers.front();
     const uint64_t token = m_fileTransfer->beginReceiveWait();
-    sendKcpFrame(peer, {MessageType::ClipboardRequest, encodeClipboardRequest(true)});
-    peer.kcp->update(static_cast<IUINT32>(GetTickCount64() & 0xFFFFFFFFU));
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
+        if (m_peers.empty()) {
+            Logger::write("slave: cannot request clipboard files, no connected master");
+            return {};
+        }
+        Peer& peer = m_peers.front();
+        const bool sent = sendKcpFrame(peer,
+                                       {MessageType::ClipboardRequest,
+                                        encodeClipboardRequest(true)});
+        if (sent && peer.kcp) {
+            peer.kcp->flush();
+        }
+        Logger::write("slave: requested clipboard files from master, sent=" +
+                      std::to_string(sent ? 1 : 0));
+    }
 
     const uint64_t deadline = GetTickCount64() + 30000;
     while (GetTickCount64() < deadline) {
@@ -375,9 +422,10 @@ std::vector<FileEntry> SlaveNet::requestClipboardFiles() {
                 m_fileTransfer->consumeReceiveResult();
             return result.success ? result.files : std::vector<FileEntry>{};
         }
-        // Keep KCP alive while the clipboard render callback blocks this thread.
+        // WM_RENDERFORMAT blocks the service loop, so keep KCP pumping here.
         poll(GetTickCount64());
     }
+    Logger::write("slave: timed out waiting for clipboard files");
     return {};
 }
 

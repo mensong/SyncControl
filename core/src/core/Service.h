@@ -72,7 +72,6 @@ private:
     std::string m_pendingClipboardTarget;
     std::string m_lastSentClipboardText;
     std::string m_filesClipboardSource;
-    std::vector<FileEntry> m_lastSentClipboardFiles;
     bool m_running = false;
 };
 

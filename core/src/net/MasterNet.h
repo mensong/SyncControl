@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -111,6 +112,7 @@ private:
 
     UdpSocket m_socket;
     std::vector<Peer> m_peers;
+    mutable std::recursive_mutex m_networkMutex;
     bool m_pendingMouseMove = false;
     uint16_t m_pendingMoveX = 0;
     uint16_t m_pendingMoveY = 0;

@@ -39,20 +39,6 @@ bool iequals(const std::string& left, const std::string& right) {
     return true;
 }
 
-bool filesEqual(const std::vector<FileEntry>& left, const std::vector<FileEntry>& right) {
-    if (left.size() != right.size()) {
-        return false;
-    }
-    for (size_t index = 0; index < left.size(); ++index) {
-        const FileEntry& a = left[index];
-        const FileEntry& b = right[index];
-        if (a.path != b.path || a.name != b.name || a.size != b.size || a.isDir != b.isDir) {
-            return false;
-        }
-    }
-    return true;
-}
-
 bool parseKcpParameters(const nlohmann::json& value, KcpParameters& parameters) {
     if (!value.is_object()) {
         return false;
@@ -445,11 +431,11 @@ void Service::stopMode() {
         m_fileTransfer->stop();
     }
     if (m_clipboard) {
-        m_clipboard->stop();
+        m_clipboard->clearRemoteClipboardState();
+        m_clipboard->setFileRequestHandler(nullptr);
     }
     m_pendingClipboardTarget.clear();
     m_lastSentClipboardText.clear();
-    m_lastSentClipboardFiles.clear();
     m_filesClipboardSource.clear();
     m_role = "idle";
 }
@@ -468,11 +454,7 @@ void Service::handleClipboardSync(const std::string& fromPeerId,
         const ClipboardMonitor::Snapshot snapshot = m_clipboard->snapshot();
         if (snapshot.state == ClipboardMonitor::State::Files &&
             !snapshot.files.empty() && !toPeerId.empty()) {
-            if (filesEqual(snapshot.files, m_lastSentClipboardFiles)) {
-                return;
-            }
             if (m_master->sendFilesMetaTo(toPeerId, snapshot.files)) {
-                m_lastSentClipboardFiles = snapshot.files;
                 m_lastSentClipboardText.clear();
                 m_filesClipboardSource.clear();
             }
@@ -487,7 +469,6 @@ void Service::handleClipboardSync(const std::string& fromPeerId,
         }
         if (m_master->sendClipboardTextTo(toPeerId, snapshot.text)) {
             m_lastSentClipboardText = snapshot.text;
-            m_lastSentClipboardFiles.clear();
             m_filesClipboardSource.clear();
         }
         return;
@@ -543,6 +524,7 @@ void Service::handleClipboardFilesRequest(const std::string& fromPeerId,
                                           const std::string& fromPeerIp) {
     (void)fromPeerId;
     if (m_master == nullptr || m_fileTransfer == nullptr) {
+        Logger::write("master: cannot handle clipboard files request, service unavailable");
         return;
     }
 
@@ -552,8 +534,13 @@ void Service::handleClipboardFilesRequest(const std::string& fromPeerId,
             const ClipboardMonitor::Snapshot snapshot = m_clipboard->snapshot();
             if (snapshot.state == ClipboardMonitor::State::Files &&
                 !snapshot.files.empty()) {
+                Logger::write("master: sending local clipboard files peer=" + fromPeerId +
+                              ", ip=" + fromPeerIp + ", count=" +
+                              std::to_string(snapshot.files.size()));
                 m_fileTransfer->sendAsync(snapshot.files, fromPeerIp,
                                           m_master->peerFilePortByIp(fromPeerIp));
+            } else {
+                Logger::write("master: no local files available for clipboard files request");
             }
         }
         return;
@@ -561,8 +548,10 @@ void Service::handleClipboardFilesRequest(const std::string& fromPeerId,
 
     const std::string source = m_filesClipboardSource;
     if (!m_master->sendClipboardRequestTo(source, true)) {
+        Logger::write("master: cannot relay clipboard files request source=" + source);
         return;
     }
+    Logger::write("master: relaying clipboard files from " + source + " to " + fromPeerIp);
     // The relay worker waits for the next inbound TCP session, then forwards it.
     m_fileTransfer->relayAsync(fromPeerIp, m_master->peerFilePortByIp(fromPeerIp));
     // Master is only a relay here; drop the source so a later local paste
