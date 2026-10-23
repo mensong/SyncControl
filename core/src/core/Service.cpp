@@ -555,6 +555,7 @@ void Service::stopMode() {
     }
     m_pendingClipboardTarget.clear();
     m_lastSentClipboardText.clear();
+    m_lastSentClipboardFilesKey.clear();
     m_filesClipboardSource.clear();
     m_pendingConfirmTaskId = 0;
     m_pendingConfirmOrigin.clear();
@@ -578,13 +579,22 @@ void Service::handleClipboardSync(const std::string& fromPeerId,
         if (snapshot.state == ClipboardMonitor::State::Files &&
             !snapshot.files.empty() && !toPeerId.empty()) {
             const bool hasRemoteOrigin = !snapshot.originPeerId.empty();
+            const std::string origin =
+                hasRemoteOrigin ? snapshot.originPeerId : std::string();
+            const uint32_t sequence = hasRemoteOrigin
+                                          ? snapshot.originClipboardSequence
+                                          : snapshot.clipboardSequence;
+            const std::string dedupeKey = toPeerId + "|" + origin + "|" +
+                                          std::to_string(sequence) + "|" +
+                                          std::to_string(snapshot.files.size());
+            if (dedupeKey == m_lastSentClipboardFilesKey) {
+                return;
+            }
+            m_lastSentClipboardFilesKey = dedupeKey;
             if (m_master->sendFilesMetaTo(toPeerId, snapshot.files,
-                                          snapshot.originPeerId,
-                                          hasRemoteOrigin
-                                              ? snapshot.originClipboardSequence
-                                              : snapshot.clipboardSequence)) {
+                                          origin, sequence)) {
                 m_lastSentClipboardText.clear();
-                m_filesClipboardSource.clear();
+                m_filesClipboardSource = origin;
             }
             return;
         }

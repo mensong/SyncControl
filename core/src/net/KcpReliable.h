@@ -29,9 +29,12 @@ public:
     bool send(const uint8_t* data, size_t size);
     int recv(uint8_t* data, size_t size);
     int input(const char* data, long size);
+    IUINT32 rcvNext() const;
     void update(IUINT32 currentMs);
     void flush();
     void setParameters(const KcpParameters& parameters);
+    // Drops all sequence state; used when a restarted peer opens a new stream.
+    void resetSession();
 
 private:
     struct OutputContext {
@@ -44,6 +47,8 @@ private:
     void flushOutput();
 
     ikcpcb* m_kcp = nullptr;
+    IUINT32 m_conversationId = 0;
+    KcpParameters m_parameters;
     UdpSocket* m_socket = nullptr;
     OutputContext m_outputContext{};
     std::vector<uint8_t> m_outputBatch;

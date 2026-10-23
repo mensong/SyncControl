@@ -14,6 +14,8 @@ namespace {
 
 constexpr uint16_t kKcpConversation = 1;
 constexpr uint64_t kPeerTimeoutMs = 8000;
+constexpr uint8_t kKcpCmdPush = 81;
+constexpr size_t kKcpSegmentHeaderSize = 24;
 
 bool sameEndpoint(const sockaddr_in& left, const sockaddr_in& right) {
     return left.sin_family == right.sin_family &&
@@ -24,6 +26,13 @@ bool sameEndpoint(const sockaddr_in& left, const sockaddr_in& right) {
 uint16_t readU16(const uint8_t* data) {
     return static_cast<uint16_t>(data[0]) |
            static_cast<uint16_t>(static_cast<uint16_t>(data[1]) << 8);
+}
+
+uint32_t readU32(const uint8_t* data) {
+    return static_cast<uint32_t>(data[0]) |
+           static_cast<uint32_t>(data[1]) << 8 |
+           static_cast<uint32_t>(data[2]) << 16 |
+           static_cast<uint32_t>(data[3]) << 24;
 }
 
 std::string localHostname() {
@@ -63,6 +72,36 @@ bool hasLocalFiles(const std::vector<FileEntry>& files) {
                                          [](const FileEntry& entry) {
                                              return !entry.path.empty();
                                          });
+}
+
+// A restarted master opens a brand-new KCP stream with sequence numbers
+// reset to zero. A stale local session would drop those segments forever,
+// so recognize an authenticated handshake request from the raw datagram and
+// report its sequence before ikcp_input discards it.
+bool isAuthenticatedHandshakePacket(const std::vector<uint8_t>& buffer, size_t size,
+                                    uint32_t& sequence) {
+    if (size < 2 + kKcpSegmentHeaderSize) {
+        return false;
+    }
+    const uint8_t* segment = buffer.data() + 2;
+    if (segment[4] != kKcpCmdPush) {
+        return false;
+    }
+    sequence = readU32(segment + 12);
+    const uint32_t length = readU32(segment + 20);
+    if (length == 0 || size < 2 + kKcpSegmentHeaderSize + length) {
+        return false;
+    }
+    size_t offset = 0;
+    Message message{MessageType::Heartbeat, {}};
+    if (!decodeMessage(segment + kKcpSegmentHeaderSize, length, offset, message) ||
+        message.type != MessageType::HandshakeRequest) {
+        return false;
+    }
+    std::string peerId;
+    std::string keyHash;
+    return decodeHandshakeRequest(message.payload, peerId, keyHash) &&
+           keyHash == sha256Hex(SecurityKeyStore::load());
 }
 
 }  // namespace
@@ -215,6 +254,21 @@ void SlaveNet::receiveUdp(uint64_t nowMs) {
                 continue;
             }
             while (decodeMessage(buffer.data(), static_cast<size_t>(size), offset, message)) {
+                if (message.type == MessageType::HeartbeatPing) {
+                    std::string peerId;
+                    std::string keyHash;
+                    if (decodeHeartbeatPing(message.payload, peerId, keyHash) &&
+                        keyHash == sha256Hex(SecurityKeyStore::load())) {
+                        peer->lastSeenMs = nowMs;
+                        const Message pong{
+                            MessageType::HeartbeatPong,
+                            encodeHeartbeat(peer->id.empty() ? peerId : peer->id),
+                        };
+                        const std::vector<uint8_t> bytes = serializeMessage(pong);
+                        m_socket.sendTo(peer->endpoint, bytes.data(), bytes.size());
+                    }
+                    continue;
+                }
                 if (message.type == MessageType::HandshakeResponse) {
                     std::string peerId;
                     uint16_t width = 0;
@@ -230,7 +284,13 @@ void SlaveNet::receiveUdp(uint64_t nowMs) {
         }
 
         Peer& peer = ensurePeer(source, nowMs);
-        peer.lastSeenMs = nowMs;
+        uint32_t incomingSequence = 0;
+        if (isAuthenticatedHandshakePacket(buffer, static_cast<size_t>(size),
+                                           incomingSequence) &&
+            incomingSequence < peer.kcp->rcvNext()) {
+            peer.lastSeenMs = nowMs;
+            peer.kcp->resetSession();
+        }
         peer.kcp->input(reinterpret_cast<char*>(buffer.data() + 2), size - 2);
         peer.kcp->update(static_cast<IUINT32>(nowMs & 0xFFFFFFFFU));
         drainKcp(peer, nowMs);
@@ -249,6 +309,7 @@ void SlaveNet::drainKcp(Peer& peer, uint64_t nowMs) {
         size_t offset = 0;
         Message message{MessageType::Heartbeat, {}};
         while (decodeMessage(buffer.data(), static_cast<size_t>(size), offset, message)) {
+            peer.lastSeenMs = nowMs;
             handleFrame(peer, message, nowMs);
         }
     }

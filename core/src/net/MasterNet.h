@@ -41,6 +41,9 @@ public:
         uint16_t filePort = 19881;
         uint64_t lastSeenMs = 0;
         uint64_t lastPacketMs = 0;
+        uint64_t lastRawHeartbeatSentMs = 0;
+        uint64_t lastKcpSeenMs = 0;
+        uint64_t lastHandshakeSentMs = 0;
         uint64_t heartbeatSentMs = 0;
         uint64_t firstAttemptMs = 0;
         uint32_t lastRttMs = 0;
@@ -109,6 +112,7 @@ private:
     void resetPeer(Peer& peer, uint64_t nowMs);
     void applyNetworkProfile(Peer& peer, bool lan);
     void sendHandshake(Peer& peer);
+    void sendRawHeartbeat(Peer& peer, uint64_t nowMs);
     void sendHeartbeat(Peer& peer, uint64_t nowMs);
     void receiveUdp(uint64_t nowMs);
     void drainKcp(Peer& peer, uint64_t nowMs);

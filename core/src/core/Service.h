@@ -99,6 +99,7 @@ private:
     std::string m_role = "idle";
     std::string m_pendingClipboardTarget;
     std::string m_lastSentClipboardText;
+    std::string m_lastSentClipboardFilesKey;
     std::string m_filesClipboardSource;
     std::thread::id m_serviceThreadId;
     bool m_running = false;

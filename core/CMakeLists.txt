@@ -50,7 +50,7 @@ endif()
 
 if(MSVC)
     target_link_options(SyncControlCore PRIVATE
-        "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
+        "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup" "/MANIFESTUAC:NO")
 endif()
 
 target_link_libraries(SyncControlCore PRIVATE ws2_32 user32 shell32 bcrypt advapi32 comctl32)

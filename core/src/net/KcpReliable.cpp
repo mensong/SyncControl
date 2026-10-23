@@ -16,7 +16,7 @@ void appendU16(std::vector<uint8_t>& output, uint16_t value) {
 }  // namespace
 
 KcpReliable::KcpReliable(UdpSocket& socket, const sockaddr_in& endpoint, IUINT32 conversationId)
-    : m_socket(&socket) {
+    : m_conversationId(conversationId), m_socket(&socket) {
     m_outputContext.socket = &socket;
     m_outputContext.endpoint = endpoint;
     m_outputContext.batch = &m_outputBatch;
@@ -51,6 +51,10 @@ int KcpReliable::input(const char* data, long size) {
     return ikcp_input(m_kcp, data, size);
 }
 
+IUINT32 KcpReliable::rcvNext() const {
+    return m_kcp != nullptr ? m_kcp->rcv_nxt : 0;
+}
+
 void KcpReliable::update(IUINT32 currentMs) {
     if (m_kcp != nullptr) {
         ikcp_update(m_kcp, currentMs);
@@ -63,12 +67,24 @@ void KcpReliable::flush() {
 }
 
 void KcpReliable::setParameters(const KcpParameters& parameters) {
+    m_parameters = parameters;
     if (m_kcp == nullptr) {
         return;
     }
     ikcp_nodelay(m_kcp, parameters.nodelay, parameters.interval, parameters.resend,
                  parameters.nc);
     ikcp_wndsize(m_kcp, parameters.sendWindow, parameters.receiveWindow);
+}
+
+void KcpReliable::resetSession() {
+    if (m_kcp != nullptr) {
+        ikcp_release(m_kcp);
+    }
+    m_outputBatch.clear();
+    m_kcp = ikcp_create(m_conversationId, &m_outputContext);
+    m_kcp->output = &KcpReliable::onKcpOutput;
+    setParameters(m_parameters);
+    ikcp_setmtu(m_kcp, 1200);
 }
 
 int KcpReliable::onKcpOutput(const char* data, int size, ikcpcb* /*kcp*/, void* user) {

@@ -136,6 +136,29 @@ bool decodeHeartbeat(const std::vector<uint8_t>& payload, std::string& peerId) {
     }
 }
 
+std::vector<uint8_t> encodeHeartbeatPing(const std::string& peerId,
+                                         const std::string& keyHash) {
+    const json payload = {
+        {"id", peerId},
+        {"keyHash", keyHash},
+    };
+    const std::string text = payload.dump();
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+bool decodeHeartbeatPing(const std::vector<uint8_t>& payload,
+                         std::string& peerId,
+                         std::string& keyHash) {
+    try {
+        const json value = json::parse(payload.begin(), payload.end());
+        peerId = value.at("id").get<std::string>();
+        keyHash = value.at("keyHash").get<std::string>();
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
 std::vector<uint8_t> encodeMouseMove(uint32_t sequence, uint16_t x, uint16_t y) {
     std::vector<uint8_t> payload;
     payload.push_back(static_cast<uint8_t>(sequence & 0xFF));

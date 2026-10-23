@@ -448,7 +448,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
                 return;
             }
 
-            var config = JsonSerializer.Deserialize<LayoutConfig>(File.ReadAllText(LayoutFilePath));
+            var config = JsonSerializer.Deserialize<LayoutConfig>(
+                File.ReadAllText(LayoutFilePath), JsonOptions);
             if (config?.Screens is not { Count: > 0 } screens)
             {
                 AddMaster();
@@ -466,8 +467,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
                 AddMaster();
             }
         }
-        catch (Exception)
+        catch (Exception error)
         {
+            FileLogger.Error("load layout failed", error);
             Screens.Clear();
             AddMaster();
         }

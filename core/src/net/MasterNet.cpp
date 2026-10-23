@@ -15,6 +15,8 @@ namespace {
 constexpr uint16_t kKcpConversation = 1;
 constexpr uint64_t kHandshakeRetryMs = 1000;
 constexpr uint64_t kHeartbeatIntervalMs = 1000;
+constexpr uint64_t kRawHeartbeatIntervalMs = 1000;
+constexpr uint64_t kKcpLivenessMs = 4000;
 constexpr uint64_t kPeerTimeoutMs = 8000;
 constexpr uint64_t kUdpWarningMs = 5000;
 
@@ -400,6 +402,9 @@ void MasterNet::resetPeer(Peer& peer, uint64_t nowMs) {
     peer.screenH = 0;
     peer.lastSeenMs = nowMs;
     peer.lastPacketMs = 0;
+    peer.lastRawHeartbeatSentMs = 0;
+    peer.lastKcpSeenMs = 0;
+    peer.lastHandshakeSentMs = nowMs;
     peer.heartbeatSentMs = 0;
     peer.lastRttMs = 0;
     sendHandshake(peer);
@@ -413,6 +418,16 @@ void MasterNet::sendHandshake(Peer& peer) {
     };
     const std::vector<uint8_t> bytes = serializeMessage(message);
     peer.kcp->send(bytes.data(), bytes.size());
+}
+
+void MasterNet::sendRawHeartbeat(Peer& peer, uint64_t nowMs) {
+    const Message message{
+        MessageType::HeartbeatPing,
+        encodeHeartbeatPing(m_peerId, sha256Hex(SecurityKeyStore::load())),
+    };
+    if (sendFrame(peer, message)) {
+        peer.lastRawHeartbeatSentMs = nowMs;
+    }
 }
 
 void MasterNet::applyNetworkProfile(Peer& peer, bool lan) {
@@ -461,9 +476,12 @@ void MasterNet::poll(uint64_t nowMs) {
     for (Peer& peer : m_peers) {
         peer.kcp->update(static_cast<IUINT32>(nowMs & 0xFFFFFFFFU));
 
+        if (nowMs - peer.lastRawHeartbeatSentMs >= kRawHeartbeatIntervalMs) {
+            sendRawHeartbeat(peer, nowMs);
+        }
         if (!peer.connected && peer.endpoint.sin_family != 0 &&
-            nowMs - peer.lastSeenMs >= kHandshakeRetryMs) {
-            peer.lastSeenMs = nowMs;
+            nowMs - peer.lastHandshakeSentMs >= kHandshakeRetryMs) {
+            peer.lastHandshakeSentMs = nowMs;
             sendHandshake(peer);
             if (!peer.udpWarningSent && nowMs - peer.firstAttemptMs >= kUdpWarningMs) {
                 peer.udpWarningSent = true;
@@ -476,6 +494,11 @@ void MasterNet::poll(uint64_t nowMs) {
 
         if (peer.connected && nowMs - peer.lastSeenMs >= kPeerTimeoutMs) {
             Logger::write("master: peer " + peer.id + " timed out, reconnecting");
+            resetPeer(peer, nowMs);
+        } else if (peer.connected && peer.lastKcpSeenMs != 0 &&
+                   nowMs - peer.lastKcpSeenMs >= kKcpLivenessMs) {
+            Logger::write("master: peer " + peer.id +
+                          " raw heartbeat is alive; resetting KCP session");
             resetPeer(peer, nowMs);
         }
 
@@ -521,6 +544,16 @@ void MasterNet::receiveUdp(uint64_t nowMs) {
             size_t offset = 0;
             Message message{MessageType::Heartbeat, {}};
             while (decodeMessage(buffer.data(), static_cast<size_t>(size), offset, message)) {
+                if (message.type == MessageType::HeartbeatPong) {
+                    std::string peerId;
+                    if (decodeHeartbeat(message.payload, peerId)) {
+                        Peer* heartbeatPeer = findPeer(source);
+                        if (heartbeatPeer != nullptr) {
+                            heartbeatPeer->lastSeenMs = nowMs;
+                        }
+                    }
+                    continue;
+                }
                 if (message.type != MessageType::SlaveHello) {
                     continue;
                 }
@@ -590,6 +623,7 @@ void MasterNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) 
                 if (!peer.connected) {
                     peer.connected = true;
                     peer.lastRttMs = 0;
+                    peer.lastKcpSeenMs = nowMs;
                     Logger::write("master: peer " + peer.id + " connected");
                 }
                 peer.lastSeenMs = nowMs;
@@ -601,6 +635,7 @@ void MasterNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) 
             std::string peerId;
             if (decodeHeartbeat(message.payload, peerId)) {
                 peer.lastSeenMs = nowMs;
+                peer.lastKcpSeenMs = nowMs;
                 // The slave replies to every heartbeat, so this delta is the RTT.
                 if (peer.heartbeatSentMs != 0) {
                     peer.lastRttMs = static_cast<uint32_t>(nowMs - peer.heartbeatSentMs);

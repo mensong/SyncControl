@@ -29,6 +29,11 @@ enum class MessageType : uint16_t {
     // Slave-initiated discovery. A configured peer can still use the original
     // master-initiated KCP handshake; this makes an unconfigured slave show up.
     SlaveHello = 0x50,
+
+    // Liveness probes outside KCP. They are intentionally lossy: a missed
+    // probe must not allocate reliable-queue state or block business traffic.
+    HeartbeatPing = 0x51,
+    HeartbeatPong = 0x52,
 };
 
 enum class Channel {
@@ -115,6 +120,12 @@ bool decodeHandshakeResponse(const std::vector<uint8_t>& payload,
 
 std::vector<uint8_t> encodeHeartbeat(const std::string& peerId);
 bool decodeHeartbeat(const std::vector<uint8_t>& payload, std::string& peerId);
+
+std::vector<uint8_t> encodeHeartbeatPing(const std::string& peerId,
+                                         const std::string& keyHash);
+bool decodeHeartbeatPing(const std::vector<uint8_t>& payload,
+                         std::string& peerId,
+                         std::string& keyHash);
 
 std::vector<uint8_t> encodeMouseMove(uint32_t sequence, uint16_t x, uint16_t y);
 // Accepts the legacy 4-byte format and the current 8-byte sequence format.
