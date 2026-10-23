@@ -325,7 +325,12 @@ void SlaveNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) {
                 m_clipboard->refresh();
                 const ClipboardMonitor::Snapshot snapshot = m_clipboard->snapshot();
                 if (hasLocalFiles(snapshot.files)) {
-                    sendFilesMeta(peer, snapshot.files, snapshot.clipboardSequence);
+                    const bool hasOrigin = !snapshot.originPeerId.empty();
+                    sendFilesMeta(peer, snapshot.files,
+                                  hasOrigin ? snapshot.originPeerId : m_peerId,
+                                  hasOrigin && snapshot.originClipboardSequence != 0
+                                      ? snapshot.originClipboardSequence
+                                      : snapshot.clipboardSequence);
                 } else if (snapshot.state == ClipboardMonitor::State::Text &&
                            !snapshot.text.empty()) {
                     sendKcpFrame(peer, {MessageType::ClipboardText,
@@ -373,9 +378,10 @@ bool SlaveNet::sendKcpFrame(Peer& peer, const Message& message) {
 }
 
 void SlaveNet::sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files,
+                             const std::string& originPeerId,
                              uint32_t originClipboardSequence) {
     const std::vector<uint8_t> payload =
-        encodeFilesMeta(files, m_peerId, originClipboardSequence);
+        encodeFilesMeta(files, originPeerId, originClipboardSequence);
     if (payload.size() > 0xFFFF) {
         Logger::write("slave: clipboard files meta too large, bytes=" +
                       std::to_string(payload.size()));

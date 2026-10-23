@@ -80,6 +80,7 @@ private:
     void handleMouseMove(Peer* peer, const Message& message);
     bool sendKcpFrame(Peer& peer, const Message& message);
     void sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files,
+                       const std::string& originPeerId,
                        uint32_t originClipboardSequence);
     void sendHandshakeResponse(Peer& peer);
     void sendHeartbeat(Peer& peer);

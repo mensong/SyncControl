@@ -83,6 +83,7 @@ private:
     LRESULT handleRenderFormat(UINT format);
     void reinstallPendingRemoteFiles();
     bool readClipboard(Snapshot& out) const;
+    void readClipboardOrigin(Snapshot& out) const;
     bool storeIfChanged(Snapshot&& snapshot);
     void rememberClipboardUpdate();
 
@@ -96,6 +97,7 @@ private:
     std::mutex m_actionMutex;
     std::vector<std::function<void()>> m_actions;
     UINT m_filesFormat = 0;
+    UINT m_originFormat = 0;
     DWORD m_expectedClipboardSequence = 0;
     bool m_hasPendingRemoteFiles = false;
     bool m_renderingFiles = false;

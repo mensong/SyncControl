@@ -4,6 +4,7 @@
 #include <shlobj_core.h>
 
 #include <cstring>
+#include <json.hpp>
 #include <string>
 #include <vector>
 #include <wchar.h>
@@ -185,6 +186,15 @@ std::string filesMetaText(const std::vector<FileEntry>& files) {
     return text;
 }
 
+std::string clipboardOriginText(const std::string& originPeerId,
+                                uint32_t originClipboardSequence) {
+    const nlohmann::json payload = {
+        {"origin", originPeerId},
+        {"sequence", originClipboardSequence},
+    };
+    return payload.dump();
+}
+
 // Explorer pastes top-level entries; the received list also contains directory
 // descendants, so only names without "/" belong in the rendered HDROP.
 HGLOBAL allocHdrop(const std::vector<FileEntry>& files) {
@@ -262,6 +272,9 @@ bool ClipboardMonitor::start() {
     if (m_filesFormat == 0) {
         m_filesFormat = RegisterClipboardFormatW(L"SyncControl.Files");
     }
+    if (m_originFormat == 0) {
+        m_originFormat = RegisterClipboardFormatW(L"SyncControl.ClipboardOrigin");
+    }
     if (m_window == nullptr) {
         const DWORD messageWindowError = GetLastError();
         Logger::write("clipboard: message-only window creation failed, win32Error=" +
@@ -335,6 +348,7 @@ void ClipboardMonitor::stop() {
         m_actions.clear();
     }
     m_filesFormat = 0;
+    m_originFormat = 0;
     m_expectedClipboardSequence = 0;
     m_hasPendingRemoteFiles = false;
     m_renderingFiles = false;
@@ -397,6 +411,7 @@ bool ClipboardMonitor::readClipboard(Snapshot& out) const {
         if (handle != nullptr) {
             out.state = State::Files;
             out.files = buildFileEntries(static_cast<HDROP>(handle));
+            readClipboardOrigin(out);
         }
     } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
         const HANDLE handle = GetClipboardData(CF_UNICODETEXT);
@@ -422,6 +437,41 @@ bool ClipboardMonitor::readClipboard(Snapshot& out) const {
                       std::to_string(out.files.size()));
     }
     return true;
+}
+
+void ClipboardMonitor::readClipboardOrigin(Snapshot& out) const {
+    if (out.state != State::Files || m_originFormat == 0 ||
+        !IsClipboardFormatAvailable(m_originFormat)) {
+        return;
+    }
+
+    const HANDLE handle = GetClipboardData(m_originFormat);
+    if (handle == nullptr) {
+        return;
+    }
+    const SIZE_T bytes = GlobalSize(handle);
+    const auto* text = static_cast<const char*>(
+        GlobalLock(static_cast<HGLOBAL>(handle)));
+    if (text == nullptr || bytes == 0) {
+        if (text != nullptr) {
+            GlobalUnlock(static_cast<HGLOBAL>(handle));
+        }
+        return;
+    }
+
+    const size_t length = strnlen(text, bytes);
+    if (length != 0) {
+        try {
+            const nlohmann::json value = nlohmann::json::parse(text, text + length);
+            out.originPeerId = value.value("origin", std::string());
+            const uint64_t sequence = value.value("sequence", 0ULL);
+            out.originClipboardSequence = static_cast<uint32_t>(sequence);
+        } catch (const std::exception&) {
+            out.originPeerId.clear();
+            out.originClipboardSequence = 0;
+        }
+    }
+    GlobalUnlock(static_cast<HGLOBAL>(handle));
 }
 
 bool ClipboardMonitor::storeIfChanged(Snapshot&& snapshot) {
@@ -513,6 +563,14 @@ bool ClipboardMonitor::setPendingFilesMeta(
         if (metadata != nullptr && SetClipboardData(m_filesFormat, metadata) == nullptr) {
             GlobalFree(metadata);
         }
+        if (!originPeerId.empty()) {
+            const HGLOBAL origin = allocUtf8Blob(
+                clipboardOriginText(originPeerId, originClipboardSequence));
+            if (origin != nullptr && SetClipboardData(m_originFormat, origin) == nullptr) {
+                GlobalFree(origin);
+                Logger::write("clipboard: failed to set clipboard origin format");
+            }
+        }
         // A null handle defers CF_HDROP rendering until the paste target asks.
         // For delayed rendering this API returns null on success.
         SetLastError(0);
@@ -542,6 +600,7 @@ bool ClipboardMonitor::setPendingFilesMeta(
         Snapshot snapshot;
         snapshot.state = State::Files;
         snapshot.files = files;
+        snapshot.clipboardSequence = GetClipboardSequenceNumber();
         snapshot.originPeerId = originPeerId;
         snapshot.originClipboardSequence = originClipboardSequence;
         m_cache = std::move(snapshot);
@@ -571,6 +630,14 @@ bool ClipboardMonitor::setFilesToClipboard(
                 GlobalFree(drop);
             }
         }
+        if (ok && !originPeerId.empty()) {
+            const HGLOBAL origin = allocUtf8Blob(
+                clipboardOriginText(originPeerId, originClipboardSequence));
+            if (origin != nullptr && SetClipboardData(m_originFormat, origin) == nullptr) {
+                GlobalFree(origin);
+                Logger::write("clipboard: failed to set clipboard origin format");
+            }
+        }
     }
     CloseClipboard();
     if (!ok) {
@@ -582,6 +649,7 @@ bool ClipboardMonitor::setFilesToClipboard(
         Snapshot snapshot;
         snapshot.state = State::Files;
         snapshot.files = files;
+        snapshot.clipboardSequence = GetClipboardSequenceNumber();
         snapshot.originPeerId = originPeerId;
         snapshot.originClipboardSequence = originClipboardSequence;
         m_cache = std::move(snapshot);
