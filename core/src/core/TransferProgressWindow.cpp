@@ -16,6 +16,15 @@ constexpr UINT kHideMessage = WM_APP + 212;
 constexpr int kWindowWidth = 380;
 constexpr int kWindowHeight = 112;
 constexpr int kMargin = 16;
+constexpr DWORD kWindowStyle = WS_POPUP | WS_CAPTION | WS_BORDER;
+constexpr DWORD kWindowExStyle =
+    WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE;
+
+SIZE outerWindowSize() {
+    RECT frame{0, 0, kWindowWidth, kWindowHeight};
+    AdjustWindowRectEx(&frame, kWindowStyle, FALSE, kWindowExStyle);
+    return {frame.right - frame.left, frame.bottom - frame.top};
+}
 
 std::wstring utf8ToWide(const std::string& utf8) {
     if (utf8.empty()) {
@@ -50,11 +59,6 @@ std::wstring formatBytes(uint64_t bytes) {
     wchar_t buffer[64]{};
     swprintf_s(buffer, value >= 10.0 ? L"%.0f %s" : L"%.1f %s", value, unit);
     return buffer;
-}
-
-std::unique_ptr<TransferProgressWindow::Snapshot> takeSnapshot(LPARAM lParam) {
-    return std::unique_ptr<TransferProgressWindow::Snapshot>(
-        reinterpret_cast<TransferProgressWindow::Snapshot*>(lParam));
 }
 
 }  // namespace
@@ -103,10 +107,15 @@ void TransferProgressWindow::update(const Snapshot& snapshot) {
     if (m_window == nullptr) {
         return;
     }
-    auto* pending = new Snapshot(snapshot);
-    if (!PostMessageW(m_window, kUpdateMessage, 0,
-                      reinterpret_cast<LPARAM>(pending))) {
-        delete pending;
+    bool shouldPost = false;
+    {
+        std::lock_guard<std::mutex> lock(m_contentMutex);
+        m_pendingSnapshot = snapshot;
+        shouldPost = !m_window || true;  // Post is cheap; the UI merges bursts.
+    }
+    if (shouldPost && !PostMessageW(m_window, kUpdateMessage, 0, 0)) {
+        std::lock_guard<std::mutex> lock(m_contentMutex);
+        m_pendingSnapshot.reset();
     }
 }
 
@@ -178,11 +187,12 @@ void TransferProgressWindow::createWindow() {
     const LPCWSTR className = m_classAtom != 0
                                   ? MAKEINTRESOURCEW(m_classAtom)
                                   : kClassName;
+    const SIZE outerSize = outerWindowSize();
     m_window = CreateWindowExW(
-        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        kWindowExStyle,
         className, L"文件传输",
-        WS_POPUP | WS_CAPTION | WS_BORDER,
-        CW_USEDEFAULT, CW_USEDEFAULT, kWindowWidth, kWindowHeight,
+        kWindowStyle,
+        CW_USEDEFAULT, CW_USEDEFAULT, outerSize.cx, outerSize.cy,
         nullptr, nullptr, instance, nullptr);
     if (m_window == nullptr) {
         Logger::write("progress window: create failed, win32Error=" +
@@ -221,9 +231,10 @@ void TransferProgressWindow::positionWindow() {
         workArea.right = GetSystemMetrics(SM_CXSCREEN);
         workArea.bottom = GetSystemMetrics(SM_CYSCREEN);
     }
-    const int x = workArea.right - kWindowWidth - kMargin;
-    const int y = workArea.bottom - kWindowHeight - kMargin;
-    SetWindowPos(m_window, HWND_TOPMOST, x, y, kWindowWidth, kWindowHeight,
+    const SIZE outerSize = outerWindowSize();
+    const int x = workArea.right - outerSize.cx - kMargin;
+    const int y = workArea.bottom - outerSize.cy - kMargin;
+    SetWindowPos(m_window, HWND_TOPMOST, x, y, outerSize.cx, outerSize.cy,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
 }
 
@@ -280,11 +291,12 @@ LRESULT TransferProgressWindow::handleMessage(HWND window, UINT message,
                                               WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case kUpdateMessage: {
-            const std::unique_ptr<Snapshot> snapshot = takeSnapshot(lParam);
-            if (snapshot != nullptr) {
-                updateNow(*snapshot);
-                positionWindow();
-                m_visible.store(true);
+            Snapshot snapshot;
+            if (consumePendingSnapshot(snapshot)) {
+                updateNow(snapshot);
+                if (!m_visible.exchange(true)) {
+                    positionWindow();
+                }
             }
             return 0;
         }
@@ -306,6 +318,16 @@ LRESULT TransferProgressWindow::handleMessage(HWND window, UINT message,
             break;
     }
     return DefWindowProcW(window, message, wParam, lParam);
+}
+
+bool TransferProgressWindow::consumePendingSnapshot(Snapshot& snapshot) {
+    std::lock_guard<std::mutex> lock(m_contentMutex);
+    if (!m_pendingSnapshot) {
+        return false;
+    }
+    snapshot = std::move(*m_pendingSnapshot);
+    m_pendingSnapshot.reset();
+    return true;
 }
 
 }  // namespace synccontrol

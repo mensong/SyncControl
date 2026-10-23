@@ -31,8 +31,9 @@ struct TransferProgress {
     uint64_t fileCount = 0;
     uint64_t fileTransferred = 0;
     uint64_t fileTotal = 0;
-    uint64_t batchTransferred = 0;
-    uint64_t batchTotal = 0;
+        uint64_t batchTransferred = 0;
+        uint64_t batchTotal = 0;
+        uint64_t chunkBytes = 0;
 };
 
 // Wire-level session: sender connects, streams a session header, per-file
@@ -77,6 +78,7 @@ public:
 
     Status status() const;
     void setProgressHandler(std::function<void(const Status&)> handler);
+    void setRemoteInputActiveHandler(std::function<bool()> handler);
 
     // Render waits: capture the completion counter, then wait for it to grow.
     uint64_t beginReceiveWait() const;
@@ -96,6 +98,7 @@ private:
     void updateStatus(bool active, const std::string& fileName, uint64_t transferred,
                       uint64_t total);
     void updateStatus(bool active, const TransferProgress& progress);
+    void throttleForRemoteInput(uint64_t bytes);
     void trackWorker(std::thread worker);
 
     TcpFileChannel m_listener;
@@ -110,6 +113,11 @@ private:
     Status m_status;
     std::function<void(const Status&)> m_progressHandler;
     mutable std::mutex m_progressHandlerMutex;
+    std::function<bool()> m_remoteInputActiveHandler;
+    mutable std::mutex m_remoteInputActiveHandlerMutex;
+    mutable std::mutex m_throttleMutex;
+    uint64_t m_throttleWindowStart = 0;
+    uint64_t m_throttleWindowBytes = 0;
     std::atomic<uint64_t> m_completedCount{0};
     mutable std::mutex m_resultMutex;
     ReceiveResult m_lastResult;

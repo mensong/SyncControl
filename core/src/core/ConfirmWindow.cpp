@@ -14,6 +14,16 @@ constexpr size_t kMaxPreviewNames = 8;
 constexpr UINT kShowMessage = WM_APP + 201;
 constexpr UINT kHideMessage = WM_APP + 202;
 constexpr UINT kFrontMessage = WM_APP + 203;
+constexpr int kWindowWidth = 440;
+constexpr int kWindowHeight = 260;
+constexpr DWORD kWindowStyle = WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU;
+constexpr DWORD kWindowExStyle = WS_EX_TOOLWINDOW | WS_EX_TOPMOST;
+
+SIZE outerWindowSize() {
+    RECT frame{0, 0, kWindowWidth, kWindowHeight};
+    AdjustWindowRectEx(&frame, kWindowStyle, FALSE, kWindowExStyle);
+    return {frame.right - frame.left, frame.bottom - frame.top};
+}
 
 std::wstring utf8ToWide(const std::string& utf8) {
     if (utf8.empty()) {
@@ -180,9 +190,11 @@ void ConfirmWindow::createWindow() {
     const LPCWSTR className = m_classAtom != 0
                                   ? MAKEINTRESOURCEW(m_classAtom)
                                   : kClassName;
-    m_window = CreateWindowExW(WS_EX_TOOLWINDOW | WS_EX_TOPMOST, className,
-                               L"SyncControl", WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU,
-                               CW_USEDEFAULT, CW_USEDEFAULT, 440, 260, nullptr,
+    const SIZE outerSize = outerWindowSize();
+    m_window = CreateWindowExW(kWindowExStyle, className,
+                               L"SyncControl", kWindowStyle,
+                               CW_USEDEFAULT, CW_USEDEFAULT, outerSize.cx,
+                               outerSize.cy, nullptr,
                                nullptr, instance, nullptr);
     if (m_window == nullptr) {
         Logger::write("confirm window: create failed, win32Error=" +

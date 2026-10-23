@@ -12,6 +12,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <thread>
 
@@ -55,6 +56,7 @@ private:
     void positionWindow();
     void updateNow(const Snapshot& snapshot);
     void hideNow();
+    bool consumePendingSnapshot(Snapshot& snapshot);
 
     HWND m_window = nullptr;
     HWND m_fileLabel = nullptr;
@@ -64,6 +66,8 @@ private:
     std::atomic<bool> m_visible{false};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_ready{false};
+    std::mutex m_contentMutex;
+    std::optional<Snapshot> m_pendingSnapshot;
     std::mutex m_stateMutex;
     std::condition_variable m_stateCv;
     std::thread m_thread;

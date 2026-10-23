@@ -439,9 +439,6 @@ std::vector<FileEntry> SlaveNet::requestClipboardFiles(
                 m_fileTransfer->consumeReceiveResult();
             return result.success ? result.files : std::vector<FileEntry>{};
         }
-        // The transfer worker is outside the Service loop, so keep KCP
-        // pumping while waiting for the source-side response.
-        poll(GetTickCount64());
     }
     Logger::write(cancel.load()
                       ? "slave: clipboard files request cancelled"

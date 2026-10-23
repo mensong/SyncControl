@@ -12,7 +12,9 @@ namespace {
 
 constexpr uint32_t kSessionMagic = 0x53433631;   // 'SC61'
 constexpr uint32_t kFooterMagic = 0x53433632;    // 'SC62'
-constexpr uint32_t kChunkSize = 64 * 1024;
+constexpr uint32_t kChunkSize = 256 * 1024;
+constexpr uint64_t kActiveInputBytesPerSecond = 32ULL * 1024 * 1024;
+constexpr uint64_t kActiveInputWindowMs = 100;
 constexpr uint32_t kMaxNameLen = 32768;
 constexpr uint32_t kMaxFiles = 100000;
 constexpr uint64_t kMaxTotalBytes = 1ULL << 40;  // 1TB sanity cap
@@ -392,6 +394,7 @@ bool sendFilesOverTcp(const std::vector<FileEntry>& files, const std::string& ip
                 chunkProgress.fileTotal = entry.size;
                 chunkProgress.batchTransferred = sentTotal;
                 chunkProgress.batchTotal = totalBytes;
+                chunkProgress.chunkBytes = bytesRead;
                 progress(chunkProgress);
             }
         }
@@ -440,6 +443,7 @@ bool receiveFilesOverTcp(TcpFileChannel& channel, const std::wstring& destRoot,
     }
     std::vector<std::wstring> createdFiles;
     std::vector<std::wstring> createdDirs{sessionDir};
+    std::vector<uint8_t> chunkBuffer(kChunkSize);
     auto fail = [&]() {
         cleanupCreated(createdFiles, createdDirs);
         received.clear();
@@ -560,16 +564,15 @@ bool receiveFilesOverTcp(TcpFileChannel& channel, const std::wstring& destRoot,
                 ok = false;
                 break;
             }
-            std::vector<uint8_t> buffer(chunkLen);
             const RecvOutcome chunkDataOutcome =
-                recvExact(channel, buffer.data(), chunkLen, cancel);
+                recvExact(channel, chunkBuffer.data(), chunkLen, cancel);
             if (chunkDataOutcome != RecvOutcome::Completed) {
                 logReceiveFailure("receive chunk data for " + name, chunkDataOutcome);
                 ok = false;
                 break;
             }
             DWORD writtenBytes = 0;
-            if (!WriteFile(file, buffer.data(), chunkLen, &writtenBytes, nullptr) ||
+            if (!WriteFile(file, chunkBuffer.data(), chunkLen, &writtenBytes, nullptr) ||
                 writtenBytes != chunkLen) {
                 logSystemError("write destination file " + wideToUtf8(localPath),
                                GetLastError());
@@ -587,6 +590,7 @@ bool receiveFilesOverTcp(TcpFileChannel& channel, const std::wstring& destRoot,
                 chunkProgress.fileTotal = size;
                 chunkProgress.batchTransferred = receivedTotal;
                 chunkProgress.batchTotal = totalBytes;
+                chunkProgress.chunkBytes = chunkLen;
                 progress(chunkProgress);
             }
             if (last && written < size) {
@@ -696,6 +700,7 @@ void FileTransferManager::sendAsync(std::vector<FileEntry> files, const std::str
             sendFilesOverTcp(files, ip, port, *cancel,
                              [this](const TransferProgress& progress) {
                                  updateStatus(true, progress);
+                                 throttleForRemoteInput(progress.chunkBytes);
                              });
         Logger::write("file transfer: send " +
                       std::string(success ? "completed" : "failed") + " to " + ip + ":" +
@@ -786,6 +791,7 @@ void FileTransferManager::receiveSession(SOCKET socket,
         receiveFilesOverTcp(channel, clipboardTempRoot(), files, cancel,
                             [this](const TransferProgress& progress) {
                                 updateStatus(true, progress);
+                                throttleForRemoteInput(progress.chunkBytes);
                             });
     {
         std::lock_guard<std::mutex> lock(m_resultMutex);
@@ -837,7 +843,49 @@ void FileTransferManager::setProgressHandler(
     m_progressHandler = std::move(handler);
 }
 
+void FileTransferManager::setRemoteInputActiveHandler(
+    std::function<bool()> handler) {
+    std::lock_guard<std::mutex> lock(m_remoteInputActiveHandlerMutex);
+    m_remoteInputActiveHandler = std::move(handler);
+}
+
+void FileTransferManager::throttleForRemoteInput(uint64_t bytes) {
+    if (bytes == 0) {
+        return;
+    }
+
+    std::function<bool()> activeHandler;
+    {
+        std::lock_guard<std::mutex> lock(m_remoteInputActiveHandlerMutex);
+        activeHandler = m_remoteInputActiveHandler;
+    }
+    if (!activeHandler || !activeHandler()) {
+        return;
+    }
+
+    const uint64_t now = GetTickCount64();
+    std::lock_guard<std::mutex> lock(m_throttleMutex);
+    if (m_throttleWindowStart == 0 || now - m_throttleWindowStart >= kActiveInputWindowMs) {
+        m_throttleWindowStart = now;
+        m_throttleWindowBytes = 0;
+    }
+
+    m_throttleWindowBytes += bytes;
+    const uint64_t windowLimit =
+        kActiveInputBytesPerSecond * kActiveInputWindowMs / 1000;
+    if (m_throttleWindowBytes <= windowLimit) {
+        return;
+    }
+
+    const uint64_t remaining = kActiveInputWindowMs -
+                               (now - m_throttleWindowStart);
+    Sleep(static_cast<DWORD>(remaining == 0 ? 1 : remaining));
+    m_throttleWindowStart = GetTickCount64();
+    m_throttleWindowBytes = bytes;
+}
+
 void FileTransferManager::trackWorker(std::thread worker) {
+    SetThreadPriority(worker.native_handle(), THREAD_PRIORITY_BELOW_NORMAL);
     m_workers.push_back(std::move(worker));
 }
 

@@ -66,6 +66,7 @@ public:
     const std::string& peerId() const { return m_peerId; }
     void setClipboardMonitor(ClipboardMonitor* monitor) { m_clipboard = monitor; }
     void setFileTransfer(FileTransferManager* transfer) { m_fileTransfer = transfer; }
+    bool isInputActive() const { return m_inputActive; }
     // Target-side paste: asks Master for file data, waits for TCP completion.
     std::vector<FileEntry> requestClipboardFiles(const std::atomic<bool>& cancel);
 
@@ -95,7 +96,7 @@ private:
                        uint32_t originClipboardSequence,
                        const std::vector<FileEntry>& files)> m_remoteFilesMeta;
     FileTransferManager* m_fileTransfer = nullptr;
-    bool m_inputActive = false;
+    std::atomic<bool> m_inputActive = false;
     bool m_running = false;
     std::string m_peerId;
     sockaddr_in m_masterEndpoint{};

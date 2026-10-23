@@ -330,6 +330,15 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
     m_fileTransfer->setProgressHandler([this](const FileTransferManager::Status& status) {
         handleTransferProgress(status);
     });
+    m_fileTransfer->setRemoteInputActiveHandler([this]() {
+        if (m_role == "master") {
+            return m_master != nullptr && !m_master->focusedPeerId().empty();
+        }
+        if (m_role == "slave") {
+            return m_slave != nullptr && m_slave->isInputActive();
+        }
+        return false;
+    });
     if (!m_fileTransfer->start(bindIp.empty() ? "0.0.0.0" : bindIp,
                                localPort != 0 ? localPort : 19881)) {
         m_master->stop();
@@ -464,6 +473,15 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
     }
     m_fileTransfer->setProgressHandler([this](const FileTransferManager::Status& status) {
         handleTransferProgress(status);
+    });
+    m_fileTransfer->setRemoteInputActiveHandler([this]() {
+        if (m_role == "master") {
+            return m_master != nullptr && !m_master->focusedPeerId().empty();
+        }
+        if (m_role == "slave") {
+            return m_slave != nullptr && m_slave->isInputActive();
+        }
+        return false;
     });
     if (!m_fileTransfer->start("0.0.0.0", localPort != 0 ? localPort : 19881)) {
         m_role = "idle";
@@ -927,8 +945,6 @@ std::vector<FileEntry> Service::requestRemoteFilesFromPeer(
                 m_fileTransfer->consumeReceiveResult();
             return result.success ? result.files : std::vector<FileEntry>{};
         }
-        // The source responds over KCP; pump the Service-side network state.
-        m_master->poll(GetTickCount64());
     }
     Logger::write(cancel.load()
                       ? "master: clipboard files request cancelled"
