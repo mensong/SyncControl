@@ -9,7 +9,7 @@ constexpr UINT kCallbackMessage = WM_APP + 1;
 constexpr UINT kExitCommand = 1;
 TrayIcon* g_instance = nullptr;
 
-LRESULT showContextMenu(HWND window) {
+LRESULT showContextMenu(HWND window, DWORD serviceThreadId) {
     HMENU menu = CreatePopupMenu();
     if (menu == nullptr) {
         return 0;
@@ -24,7 +24,7 @@ LRESULT showContextMenu(HWND window) {
         position.x, position.y, 0, window, nullptr);
     DestroyMenu(menu);
     if (command == kExitCommand) {
-        PostQuitMessage(0);
+        PostThreadMessageW(serviceThreadId, WM_QUIT, 0, 0);
     }
     return 0;
 }
@@ -35,32 +35,73 @@ TrayIcon::~TrayIcon() {
     stop();
 }
 
-bool TrayIcon::start(HINSTANCE instance, const wchar_t* tooltip) {
-    if (m_window != nullptr) {
+bool TrayIcon::start(HINSTANCE instance, const wchar_t* tooltip,
+                     DWORD serviceThreadId) {
+    if (m_thread.joinable()) {
         return true;
     }
+
+    m_instance = instance;
+    m_serviceThreadId = serviceThreadId;
+    m_tooltip = tooltip != nullptr ? tooltip : L"SyncControl Core";
+    g_instance = this;
+    m_thread = std::thread(&TrayIcon::threadProc, this);
+    return true;
+}
+
+void TrayIcon::threadProc() {
+    m_threadId = GetCurrentThreadId();
 
     WNDCLASSEXW windowClass{};
     windowClass.cbSize = sizeof(windowClass);
     windowClass.lpfnWndProc = &TrayIcon::windowProc;
-    windowClass.hInstance = instance;
+    windowClass.hInstance = m_instance;
     windowClass.lpszClassName = L"SyncControlCoreTrayWindow";
-    if (RegisterClassExW(&windowClass) == 0 && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
-        return false;
+    if (RegisterClassExW(&windowClass) == 0 &&
+        GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+        return;
     }
 
     m_window = CreateWindowExW(
         0, windowClass.lpszClassName, L"SyncControl Core", WS_OVERLAPPED,
-        CW_USEDEFAULT, CW_USEDEFAULT, 0, 0, nullptr, nullptr, instance, nullptr);
+        CW_USEDEFAULT, CW_USEDEFAULT, 0, 0, nullptr, nullptr, m_instance,
+        nullptr);
     if (m_window == nullptr) {
-        return false;
+        return;
     }
 
-    m_tooltip = tooltip != nullptr ? tooltip : L"SyncControl Core";
     m_icon = LoadIconW(nullptr, MAKEINTRESOURCEW(32512));
     m_taskbarCreatedMessage = RegisterWindowMessageW(L"TaskbarCreated");
-    g_instance = this;
-    return add();
+    if (!add()) {
+        return;
+    }
+
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+        TranslateMessage(&message);
+        DispatchMessageW(&message);
+    }
+
+    Shell_NotifyIconW(NIM_DELETE, &m_data);
+    DestroyWindow(m_window);
+    m_window = nullptr;
+    if (g_instance == this) {
+        g_instance = nullptr;
+    }
+}
+
+void TrayIcon::stop() {
+    if (!m_thread.joinable()) {
+        return;
+    }
+
+    // The UI thread sets its id before touching any window, so once the id
+    // exists it is safe to ask that thread to quit and join it.
+    while (m_threadId.load() == 0) {
+        Sleep(1);
+    }
+    PostThreadMessageW(m_threadId.load(), WM_QUIT, 0, 0);
+    m_thread.join();
 }
 
 bool TrayIcon::add() {
@@ -77,17 +118,6 @@ bool TrayIcon::add() {
     return Shell_NotifyIconW(NIM_ADD, &m_data) != FALSE;
 }
 
-void TrayIcon::stop() {
-    if (m_window != nullptr) {
-        Shell_NotifyIconW(NIM_DELETE, &m_data);
-        DestroyWindow(m_window);
-        m_window = nullptr;
-    }
-    if (g_instance == this) {
-        g_instance = nullptr;
-    }
-}
-
 LRESULT CALLBACK TrayIcon::windowProc(HWND window, UINT message,
                                       WPARAM wParam, LPARAM lParam) {
     if (g_instance != nullptr && message == g_instance->m_taskbarCreatedMessage &&
@@ -99,12 +129,12 @@ LRESULT CALLBACK TrayIcon::windowProc(HWND window, UINT message,
     switch (message) {
         case kCallbackMessage:
             if (LOWORD(lParam) == WM_CONTEXTMENU || LOWORD(lParam) == WM_RBUTTONUP) {
-                return showContextMenu(window);
+                return showContextMenu(window, g_instance->m_serviceThreadId);
             }
             return 0;
         case WM_COMMAND:
-            if (LOWORD(wParam) == kExitCommand) {
-                PostQuitMessage(0);
+            if (LOWORD(wParam) == kExitCommand && g_instance != nullptr) {
+                PostThreadMessageW(g_instance->m_serviceThreadId, WM_QUIT, 0, 0);
             }
             return 0;
         case WM_DESTROY:

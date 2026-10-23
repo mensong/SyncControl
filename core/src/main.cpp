@@ -73,7 +73,8 @@ int main(int argc, char** argv) {
     }
 
     synccontrol::TrayIcon trayIcon;
-    if (!trayIcon.start(GetModuleHandleW(nullptr), L"SyncControl Core 服务运行中")) {
+    if (!trayIcon.start(GetModuleHandleW(nullptr), L"SyncControl Core 服务运行中",
+                        GetCurrentThreadId())) {
         std::cerr << "Failed to create the Core tray icon\n";
     }
 
