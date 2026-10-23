@@ -3,7 +3,7 @@ Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.14.37614.0 d17.14
 MinimumVisualStudioVersion = 10.0.40219.1
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SyncControl.GUI", "gui\SyncControl.GUI\SyncControl.GUI.csproj", "{23A15EE0-9684-4A8C-A25F-5E2B847EB885}"
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SyncControl.GUI", "SyncControl.GUI\SyncControl.GUI.csproj", "{23A15EE0-9684-4A8C-A25F-5E2B847EB885}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
