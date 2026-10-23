@@ -149,9 +149,15 @@ std::vector<uint8_t> encodeClipboardText(const std::string& utf8);
 bool decodeClipboardText(const std::vector<uint8_t>& payload, std::string& utf8);
 
 // Wire payload carries name/size/dir only; the local path never leaves the
-// source machine.
-std::vector<uint8_t> encodeFilesMeta(const std::vector<FileEntry>& files);
-bool decodeFilesMeta(const std::vector<uint8_t>& payload, std::vector<FileEntry>& files);
+// source machine. origin identifies the machine whose clipboard produced the
+// batch, so an echoed batch can be ignored when it returns to that machine.
+std::vector<uint8_t> encodeFilesMeta(const std::vector<FileEntry>& files,
+                                     const std::string& originPeerId,
+                                     uint32_t originClipboardSequence);
+bool decodeFilesMeta(const std::vector<uint8_t>& payload,
+                     std::vector<FileEntry>& files,
+                     std::string& originPeerId,
+                     uint32_t& originClipboardSequence);
 
 // files=true encodes {"kind":"files"} (transfer actual file data over TCP);
 // an empty payload is the legacy "send me your clipboard content" request.

@@ -30,6 +30,16 @@ public:
         // Local snapshots carry source paths; a pending remote snapshot has
         // empty paths until the TCP transfer completes.
         std::vector<FileEntry> files;
+        uint32_t clipboardSequence = 0;
+        std::string originPeerId;
+        uint32_t originClipboardSequence = 0;
+    };
+
+    enum class RemotePasteDecision { Reject, Wait, Ready };
+
+    struct RemotePasteResult {
+        RemotePasteDecision decision = RemotePasteDecision::Reject;
+        std::vector<FileEntry> files;
     };
 
     ~ClipboardMonitor();
@@ -45,14 +55,24 @@ public:
     // Writes UTF-8 text to the system clipboard as CF_UNICODETEXT.
     bool setTextToClipboard(const std::string& utf8);
     // Installs delayed-render CF_HDROP data after receiving file metadata.
-    bool setPendingFilesMeta(const std::vector<FileEntry>& files);
+    bool setPendingFilesMeta(const std::vector<FileEntry>& files,
+                             const std::string& originPeerId = {},
+                             uint32_t originClipboardSequence = 0);
     // Writes already-downloaded files as a real CF_HDROP list.
-    bool setFilesToClipboard(const std::vector<FileEntry>& files);
-    // Called on the message-loop thread during WM_RENDERFORMAT. Input is the
-    // pending metadata; output contains downloaded local absolute paths.
-    using FileRequestFn =
-        std::function<std::vector<FileEntry>(const std::vector<FileEntry>&)>;
-    void setFileRequestHandler(FileRequestFn handler) { m_fileRequest = std::move(handler); }
+    bool setFilesToClipboard(const std::vector<FileEntry>& files,
+                             const std::string& originPeerId = {},
+                             uint32_t originClipboardSequence = 0);
+    // The gate is invoked during WM_RENDERFORMAT. Ready supplies local files
+    // synchronously; Wait keeps the delayed-render item and shows the confirm
+    // window instead of blocking Explorer on a TCP transfer.
+    using PasteGateFn =
+        std::function<RemotePasteResult(const std::vector<FileEntry>&)>;
+    void setPasteGateHandler(PasteGateFn handler) { m_pasteGate = std::move(handler); }
+    // Marshals transfer-worker completions back to the Service message loop.
+    void postClipboardAction(std::function<void()> action);
+
+    static constexpr UINT kReinstallRemoteMessage = WM_APP + 51;
+    static constexpr UINT kClipboardActionMessage = WM_APP + 52;
 
 private:
     static LRESULT CALLBACK windowProc(HWND window, UINT message,
@@ -61,6 +81,7 @@ private:
 
     LRESULT handleMessage(HWND window, UINT message, WPARAM wParam, LPARAM lParam);
     LRESULT handleRenderFormat(UINT format);
+    void reinstallPendingRemoteFiles();
     bool readClipboard(Snapshot& out) const;
     bool storeIfChanged(Snapshot&& snapshot);
     void rememberClipboardUpdate();
@@ -71,7 +92,9 @@ private:
     Snapshot m_cache;
     std::mutex m_pendingMutex;
     std::vector<FileEntry> m_pendingRemoteFiles;
-    FileRequestFn m_fileRequest;
+    PasteGateFn m_pasteGate;
+    std::mutex m_actionMutex;
+    std::vector<std::function<void()>> m_actions;
     UINT m_filesFormat = 0;
     DWORD m_expectedClipboardSequence = 0;
     bool m_hasPendingRemoteFiles = false;

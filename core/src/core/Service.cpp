@@ -70,6 +70,29 @@ nlohmann::json kcpParametersToJson(const KcpParameters& parameters) {
     };
 }
 
+size_t topLevelCount(const std::vector<FileEntry>& files) {
+    size_t count = 0;
+    for (const FileEntry& entry : files) {
+        if (entry.name.find('/') == std::string::npos) {
+            ++count;
+        }
+    }
+    return count;
+}
+
+std::vector<std::string> topLevelPreview(const std::vector<FileEntry>& files) {
+    std::vector<std::string> names;
+    for (const FileEntry& entry : files) {
+        if (entry.name.find('/') == std::string::npos) {
+            names.push_back(entry.name);
+            if (names.size() >= 8) {
+                break;
+            }
+        }
+    }
+    return names;
+}
+
 // Legacy single-IP mode keeps the P2 behavior by materializing an implicit
 // full-edge routing table and running it through the normal edge router.
 nlohmann::json buildSinglePeerLayout(const std::string& ip) {
@@ -186,6 +209,28 @@ Service::Service() {
         return handleIpc(command);
     });
     m_ipc->start();
+    m_transferQueue = std::make_unique<TransferQueue>();
+    m_confirmWindow = std::make_unique<ConfirmWindow>();
+    m_confirmWindow->setCallbacks(
+        [this]() {
+            const uint64_t taskId = m_pendingConfirmTaskId;
+            m_pendingConfirmTaskId = 0;
+            if (m_transferQueue && taskId != 0) {
+                m_transferQueue->confirm(taskId);
+            }
+        },
+        [this]() {
+            const uint64_t taskId = m_pendingConfirmTaskId;
+            ignorePendingTransfer(taskId);
+        });
+    m_confirmWindow->ensureCreated();
+    m_transferQueue->start(
+        [this](const TransferQueue::Task& task, const std::atomic<bool>& cancel) {
+            return executeRemoteFileTransfer(task, cancel);
+        },
+        [this](const TransferQueue::Task& task) {
+            handleTransferQueueEvent(task);
+        });
 }
 
 Service::~Service() {
@@ -266,6 +311,7 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
     if (!m_master) {
         m_master = std::make_unique<MasterNet>();
     }
+    m_master->setPeerId(masterId);
     if (!m_master->start(bindIp, peerInits, localPort != 0 ? localPort : 19881)) {
         m_role = "idle";
         return false;
@@ -282,6 +328,15 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
         m_role = "idle";
         std::cerr << "start_master: file transfer listener failed\n";
         return false;
+    }
+    if (m_transferQueue) {
+        m_transferQueue->start(
+            [this](const TransferQueue::Task& task, const std::atomic<bool>& cancel) {
+                return executeRemoteFileTransfer(task, cancel);
+            },
+            [this](const TransferQueue::Task& task) {
+                handleTransferQueueEvent(task);
+            });
     }
 
     {
@@ -339,8 +394,10 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
         handleClipboardText(fromPeerId, utf8);
     };
     m_master->onClipboardFiles = [this](const std::string& fromPeerId,
+                                        const std::string& originPeerId,
+                                        uint32_t originClipboardSequence,
                                         const std::vector<FileEntry>& files) {
-        handleClipboardFiles(fromPeerId, files);
+        handleClipboardFiles(fromPeerId, originPeerId, originClipboardSequence, files);
     };
     m_master->onClipboardFilesRequest = [this](const std::string& fromPeerId,
                                                const std::string& fromPeerIp) {
@@ -359,8 +416,8 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
     if (!m_clipboard->start()) {
         std::cerr << "start_master: clipboard monitor failed\n";
     }
-    m_clipboard->setFileRequestHandler([this](const std::vector<FileEntry>& metadata) {
-        return requestFilesForMasterRender(metadata);
+    m_clipboard->setPasteGateHandler([this](const std::vector<FileEntry>& metadata) {
+        return gateRemotePaste(metadata);
     });
     Logger::write("master: started with " + std::to_string(peerInits.size()) + " peers");
     persistMasterLayout(layout);
@@ -377,12 +434,22 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
     if (!m_clipboard->start()) {
         std::cerr << "start_slave: clipboard monitor failed\n";
     }
-    m_clipboard->setFileRequestHandler([this](const std::vector<FileEntry>& metadata) {
-        return requestFilesForSlaveRender(metadata);
+    m_clipboard->setPasteGateHandler([this](const std::vector<FileEntry>& metadata) {
+        return gateRemotePaste(metadata);
     });
     if (!m_slave) {
         m_slave = std::make_unique<SlaveNet>();
     }
+    m_slave->setRemoteFilesMetaHandler([this](const std::string& originPeerId,
+                                              uint32_t originClipboardSequence,
+                                              const std::vector<FileEntry>& files) {
+        std::string sourceIp = "master";
+        if (m_slave && !m_slave->peers().empty()) {
+            sourceIp = endpointAddressToString(m_slave->peers().front().endpoint);
+        }
+        handleRemoteFilesBatch("master", sourceIp, originPeerId,
+                               originClipboardSequence, files);
+    });
     m_slave->setClipboardMonitor(m_clipboard.get());
     if (!m_fileTransfer) {
         m_fileTransfer = std::make_unique<FileTransferManager>();
@@ -393,6 +460,15 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
         return false;
     }
     m_slave->setFileTransfer(m_fileTransfer.get());
+    if (m_transferQueue) {
+        m_transferQueue->start(
+            [this](const TransferQueue::Task& task, const std::atomic<bool>& cancel) {
+                return executeRemoteFileTransfer(task, cancel);
+            },
+            [this](const TransferQueue::Task& task) {
+                handleTransferQueueEvent(task);
+            });
+    }
     if (m_kcpOverride) {
         m_slave->setKcpOverride(m_kcpOverrideParameters);
     }
@@ -404,6 +480,9 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
                       ", master " + masterIp + ":" + std::to_string(masterPort));
     } else {
         m_fileTransfer->stop();
+        if (m_transferQueue) {
+            m_transferQueue->stop();
+        }
     }
     return started;
 }
@@ -418,6 +497,13 @@ void Service::applySecurityKey(const std::string& key) {
 
 void Service::stopMode() {
     Logger::write("service: mode stopped");
+    if (m_transferQueue) {
+        m_transferQueue->stop();
+    }
+    m_pendingConfirmTaskId = 0;
+    if (m_confirmWindow) {
+        m_confirmWindow->hide();
+    }
     if (m_inputCapture) {
         m_inputCapture->stop();
     }
@@ -432,11 +518,16 @@ void Service::stopMode() {
     }
     if (m_clipboard) {
         m_clipboard->clearRemoteClipboardState();
-        m_clipboard->setFileRequestHandler(nullptr);
+        m_clipboard->setPasteGateHandler(nullptr);
     }
     m_pendingClipboardTarget.clear();
     m_lastSentClipboardText.clear();
     m_filesClipboardSource.clear();
+    m_pendingConfirmTaskId = 0;
+    m_pendingConfirmOrigin.clear();
+    m_pendingConfirmSequence = 0;
+    m_lastIgnoredOrigin.clear();
+    m_lastIgnoredSequence = 0;
     m_role = "idle";
 }
 
@@ -450,11 +541,15 @@ void Service::handleClipboardSync(const std::string& fromPeerId,
     }
 
     if (fromPeerId.empty()) {
-        m_clipboard->refresh();
         const ClipboardMonitor::Snapshot snapshot = m_clipboard->snapshot();
         if (snapshot.state == ClipboardMonitor::State::Files &&
             !snapshot.files.empty() && !toPeerId.empty()) {
-            if (m_master->sendFilesMetaTo(toPeerId, snapshot.files)) {
+            const bool hasRemoteOrigin = !snapshot.originPeerId.empty();
+            if (m_master->sendFilesMetaTo(toPeerId, snapshot.files,
+                                          snapshot.originPeerId,
+                                          hasRemoteOrigin
+                                              ? snapshot.originClipboardSequence
+                                              : snapshot.clipboardSequence)) {
                 m_lastSentClipboardText.clear();
                 m_filesClipboardSource.clear();
             }
@@ -502,6 +597,8 @@ void Service::handleClipboardText(const std::string& fromPeerId, const std::stri
 }
 
 void Service::handleClipboardFiles(const std::string& fromPeerId,
+                                   const std::string& originPeerId,
+                                   uint32_t originClipboardSequence,
                                    const std::vector<FileEntry>& files) {
     if (m_master == nullptr || m_clipboard == nullptr || files.empty()) {
         return;
@@ -510,14 +607,16 @@ void Service::handleClipboardFiles(const std::string& fromPeerId,
     const std::string target = m_pendingClipboardTarget;
     m_pendingClipboardTarget.clear();
     if (!target.empty()) {
-        if (m_master->sendFilesMetaTo(target, files)) {
-            m_filesClipboardSource = fromPeerId;
+        if (m_master->sendFilesMetaTo(target, files, originPeerId,
+                                      originClipboardSequence)) {
+            m_filesClipboardSource = originPeerId.empty() ? fromPeerId : originPeerId;
         }
         return;
     }
 
-    m_filesClipboardSource = fromPeerId;
-    m_clipboard->setPendingFilesMeta(files);
+    m_filesClipboardSource = originPeerId.empty() ? fromPeerId : originPeerId;
+    handleRemoteFilesBatch(fromPeerId, fromPeerId, originPeerId,
+                           originClipboardSequence, files);
 }
 
 void Service::handleClipboardFilesRequest(const std::string& fromPeerId,
@@ -559,46 +658,241 @@ void Service::handleClipboardFilesRequest(const std::string& fromPeerId,
     m_filesClipboardSource.clear();
 }
 
-std::vector<FileEntry> Service::requestFilesForSlaveRender(
-    const std::vector<FileEntry>& metadata) {
-    (void)metadata;
-    return m_slave != nullptr ? m_slave->requestClipboardFiles() : std::vector<FileEntry>{};
+void Service::handleRemoteFilesBatch(const std::string& sourceId,
+                                     const std::string& sourceIp,
+                                     const std::string& originPeerId,
+                                     uint32_t originClipboardSequence,
+                                     const std::vector<FileEntry>& files) {
+    if (m_transferQueue == nullptr || m_clipboard == nullptr || files.empty()) {
+        return;
+    }
+
+    if (m_serviceThreadId != std::this_thread::get_id()) {
+        // A transfer worker may pump KCP while waiting. Rebind clipboard and
+        // window work to the Service thread instead of creating Win32 state
+        // on the worker.
+        m_clipboard->postClipboardAction([this, sourceId, sourceIp, originPeerId,
+                                          originClipboardSequence, files]() {
+            handleRemoteFilesBatch(sourceId, sourceIp, originPeerId,
+                                   originClipboardSequence, files);
+        });
+        return;
+    }
+
+    if (isLocalPeerId(originPeerId)) {
+        Logger::write("clipboard: ignored own clipboard files echo, origin=" +
+                      originPeerId + ", sequence=" +
+                      std::to_string(originClipboardSequence));
+        return;
+    }
+    if (originClipboardSequence != 0 && originPeerId == m_lastIgnoredOrigin &&
+        originClipboardSequence == m_lastIgnoredSequence) {
+        Logger::write("clipboard: ignored previously dismissed clipboard files, origin=" +
+                      originPeerId + ", sequence=" +
+                      std::to_string(originClipboardSequence));
+        return;
+    }
+
+    const TransferQueue::OfferResult offer =
+        m_transferQueue->offerBatch(files, sourceId, originPeerId,
+                                    originClipboardSequence, sourceIp, 0);
+    if (offer.restored) {
+        if (m_clipboard->setFilesToClipboard(offer.files, offer.originPeerId,
+                                             offer.originClipboardSequence)) {
+            if (m_pendingConfirmTaskId == offer.taskId) {
+                m_pendingConfirmTaskId = 0;
+            }
+            if (m_confirmWindow) {
+                m_confirmWindow->hide();
+            }
+            Logger::write("clipboard: restored completed remote file batch, task=" +
+                          std::to_string(offer.taskId));
+            return;
+        }
+    }
+
+    const bool installed = m_clipboard->setPendingFilesMeta(
+        files, originPeerId, originClipboardSequence);
+    Logger::write("clipboard: remote file batch offered, task=" +
+                  std::to_string(offer.taskId) + ", created=" +
+                  std::to_string(offer.created ? 1 : 0) + ", installed=" +
+                  std::to_string(installed ? 1 : 0) + ", count=" +
+                  std::to_string(files.size()));
+    if (!installed) {
+        m_transferQueue->cancel(offer.taskId);
+        return;
+    }
+
+    uint64_t totalBytes = 0;
+    for (const FileEntry& entry : files) {
+        if (!entry.isDir) {
+            totalBytes += entry.size;
+        }
+    }
+    if (offer.created) {
+        m_pendingConfirmTaskId = offer.taskId;
+        m_pendingConfirmOrigin = originPeerId;
+        m_pendingConfirmSequence = originClipboardSequence;
+        if (m_confirmWindow) {
+            const std::string displaySource =
+                originPeerId.empty() ? (sourceId.empty() ? sourceIp : sourceId)
+                                     : originPeerId;
+            m_confirmWindow->show(displaySource, topLevelCount(files), totalBytes,
+                                  topLevelPreview(files));
+        }
+    } else {
+        Logger::write("clipboard: reused existing clipboard file task=" +
+                      std::to_string(offer.taskId) + ", state=" +
+                      std::to_string(static_cast<int>(offer.state)));
+    }
 }
 
-std::vector<FileEntry> Service::requestFilesForMasterRender(
-    const std::vector<FileEntry>& metadata) {
-    (void)metadata;
-    if (m_master == nullptr || m_fileTransfer == nullptr) {
+std::vector<FileEntry> Service::executeRemoteFileTransfer(
+    const TransferQueue::Task& task, const std::atomic<bool>& cancel) {
+    (void)task;
+    if (cancel.load()) {
         return {};
     }
+    if (m_role == "slave" && m_slave != nullptr) {
+        return m_slave->requestClipboardFiles(cancel);
+    }
+    if (m_role == "master" && m_master != nullptr && m_fileTransfer != nullptr) {
+        return requestRemoteFilesFromPeer(task.sourceId, cancel);
+    }
+    Logger::write("transfer queue: no active role for task=" +
+                  std::to_string(task.id));
+    return {};
+}
 
-    if (m_filesClipboardSource.empty()) {
-        if (m_clipboard != nullptr) {
-            m_clipboard->refresh();
-            const ClipboardMonitor::Snapshot snapshot = m_clipboard->snapshot();
-            if (snapshot.state == ClipboardMonitor::State::Files) {
-                return snapshot.files;
+void Service::handleTransferQueueEvent(const TransferQueue::Task& task) {
+    switch (task.state) {
+        case TransferQueue::State::Completed:
+            if (m_clipboard != nullptr) {
+                const uint64_t taskId = task.id;
+                m_clipboard->postClipboardAction([this, taskId]() {
+                    deliverCompletedFiles(taskId);
+                });
             }
+            break;
+        case TransferQueue::State::Failed:
+            Logger::write("transfer queue: remote file task failed, task=" +
+                          std::to_string(task.id));
+            break;
+        case TransferQueue::State::Cancelled:
+            Logger::write("transfer queue: remote file task cancelled, task=" +
+                          std::to_string(task.id));
+            if (m_pendingConfirmTaskId == task.id) {
+                m_pendingConfirmTaskId = 0;
+                if (m_confirmWindow) {
+                    m_confirmWindow->hide();
+                }
+            }
+            break;
+        default:
+            break;
+    }
+}
+
+ClipboardMonitor::RemotePasteResult Service::gateRemotePaste(
+    const std::vector<FileEntry>& metadata) {
+    if (m_transferQueue == nullptr) {
+        return ClipboardMonitor::RemotePasteResult{};
+    }
+
+    const TransferQueue::PasteDecision decision =
+        m_transferQueue->decidePaste(metadata);
+    if (decision.action == TransferQueue::PasteDecision::Action::Wait) {
+        if (m_confirmWindow) {
+            m_confirmWindow->bringToFront();
         }
+        ClipboardMonitor::RemotePasteResult result;
+        result.decision = ClipboardMonitor::RemotePasteDecision::Wait;
+        return result;
+    }
+    if (decision.action == TransferQueue::PasteDecision::Action::Ready) {
+        ClipboardMonitor::RemotePasteResult result;
+        result.decision = ClipboardMonitor::RemotePasteDecision::Ready;
+        result.files = decision.files;
+        return result;
+    }
+    return ClipboardMonitor::RemotePasteResult{};
+}
+
+void Service::deliverCompletedFiles(uint64_t taskId) {
+    if (m_transferQueue == nullptr || m_clipboard == nullptr) {
+        return;
+    }
+    const TransferQueue::CompletedFiles completed =
+        m_transferQueue->takeCompletedFiles(taskId);
+    const std::vector<FileEntry>& files = completed.files;
+    if (files.empty()) {
+        return;
+    }
+    if (!m_clipboard->setFilesToClipboard(files, completed.originPeerId,
+                                          completed.originClipboardSequence)) {
+        Logger::write("clipboard: failed to install completed transfer, task=" +
+                      std::to_string(taskId));
+        return;
+    }
+    if (m_pendingConfirmTaskId == taskId) {
+        m_pendingConfirmTaskId = 0;
+        if (m_confirmWindow) {
+            m_confirmWindow->hide();
+        }
+    }
+}
+
+void Service::ignorePendingTransfer(uint64_t taskId) {
+    m_pendingConfirmTaskId = 0;
+    m_lastIgnoredOrigin = m_pendingConfirmOrigin;
+    m_lastIgnoredSequence = m_pendingConfirmSequence;
+    m_pendingConfirmOrigin.clear();
+    m_pendingConfirmSequence = 0;
+    if (m_transferQueue && taskId != 0) {
+        m_transferQueue->cancel(taskId);
+    }
+}
+
+bool Service::isLocalPeerId(const std::string& peerId) {
+    if (peerId.empty()) {
+        return false;
+    }
+    if (m_role == "master") {
+        std::lock_guard<std::mutex> lock(m_layoutMutex);
+        return iequals(peerId, m_masterScreenId);
+    }
+    if (m_role == "slave" && m_slave != nullptr) {
+        return iequals(peerId, m_slave->peerId());
+    }
+    return false;
+}
+
+std::vector<FileEntry> Service::requestRemoteFilesFromPeer(
+    const std::string& peerId, const std::atomic<bool>& cancel) {
+    if (m_master == nullptr || m_fileTransfer == nullptr || peerId.empty()) {
+        Logger::write("master: cannot request remote files, service unavailable");
         return {};
     }
 
-    const std::string source = m_filesClipboardSource;
     const uint64_t token = m_fileTransfer->beginReceiveWait();
-    if (!m_master->sendClipboardRequestTo(source, true)) {
+    if (!m_master->sendClipboardRequestTo(peerId, true)) {
+        Logger::write("master: cannot request clipboard files from " + peerId);
         return {};
     }
 
     const uint64_t deadline = GetTickCount64() + 30000;
-    while (GetTickCount64() < deadline) {
+    while (!cancel.load() && GetTickCount64() < deadline) {
         if (m_fileTransfer->waitForReceive(token, 20)) {
             const FileTransferManager::ReceiveResult result =
                 m_fileTransfer->consumeReceiveResult();
             return result.success ? result.files : std::vector<FileEntry>{};
         }
-        // Flush KCP and service heartbeats while this render callback blocks.
+        // The source responds over KCP; pump the Service-side network state.
         m_master->poll(GetTickCount64());
     }
+    Logger::write(cancel.load()
+                      ? "master: clipboard files request cancelled"
+                      : "master: timed out waiting for clipboard files from " + peerId);
     return {};
 }
 
@@ -936,6 +1230,7 @@ void Service::processIpcCommands() {
 
 void Service::run() {
     m_running = true;
+    m_serviceThreadId = std::this_thread::get_id();
     MSG message{};
     while (m_running) {
         while (PeekMessageW(&message, nullptr, 0, 0, PM_REMOVE)) {

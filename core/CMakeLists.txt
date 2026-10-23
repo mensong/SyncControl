@@ -12,6 +12,7 @@ add_executable(SyncControlCore
     src/input/InputInject.cpp
     src/clipboard/ClipboardMonitor.cpp
     src/clipboard/FileTransfer.cpp
+    src/clipboard/TransferQueue.cpp
     src/layout/ScreenLayout.cpp
     src/layout/EdgeRouter.cpp
     src/net/Protocol.cpp
@@ -21,6 +22,7 @@ add_executable(SyncControlCore
     src/net/MasterNet.cpp
     src/net/SlaveNet.cpp
     src/core/Service.cpp
+    src/core/ConfirmWindow.cpp
     src/core/Security.cpp
     src/core/Logger.cpp
     src/core/TrayIcon.cpp

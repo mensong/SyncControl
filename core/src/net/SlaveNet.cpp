@@ -325,7 +325,7 @@ void SlaveNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) {
                 m_clipboard->refresh();
                 const ClipboardMonitor::Snapshot snapshot = m_clipboard->snapshot();
                 if (hasLocalFiles(snapshot.files)) {
-                    sendFilesMeta(peer, snapshot.files);
+                    sendFilesMeta(peer, snapshot.files, snapshot.clipboardSequence);
                 } else if (snapshot.state == ClipboardMonitor::State::Text &&
                            !snapshot.text.empty()) {
                     sendKcpFrame(peer, {MessageType::ClipboardText,
@@ -336,8 +336,13 @@ void SlaveNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) {
         }
         case MessageType::ClipboardFilesMeta: {
             std::vector<FileEntry> files;
-            if (decodeFilesMeta(message.payload, files) && !files.empty()) {
-                if (m_clipboard != nullptr) {
+            std::string originPeerId;
+            uint32_t originClipboardSequence = 0;
+            if (decodeFilesMeta(message.payload, files, originPeerId,
+                                originClipboardSequence) && !files.empty()) {
+                if (m_remoteFilesMeta) {
+                    m_remoteFilesMeta(originPeerId, originClipboardSequence, files);
+                } else if (m_clipboard != nullptr) {
                     const bool installed = m_clipboard->setPendingFilesMeta(files);
                     Logger::write(std::string("slave: ") +
                                   (installed ? "installed" : "failed to install") +
@@ -367,8 +372,10 @@ bool SlaveNet::sendKcpFrame(Peer& peer, const Message& message) {
     return peer.kcp->send(bytes.data(), bytes.size());
 }
 
-void SlaveNet::sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files) {
-    const std::vector<uint8_t> payload = encodeFilesMeta(files);
+void SlaveNet::sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files,
+                             uint32_t originClipboardSequence) {
+    const std::vector<uint8_t> payload =
+        encodeFilesMeta(files, m_peerId, originClipboardSequence);
     if (payload.size() > 0xFFFF) {
         Logger::write("slave: clipboard files meta too large, bytes=" +
                       std::to_string(payload.size()));
@@ -387,7 +394,11 @@ void SlaveNet::sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files) {
     }
 }
 
-std::vector<FileEntry> SlaveNet::requestClipboardFiles() {
+std::vector<FileEntry> SlaveNet::requestClipboardFiles(
+    const std::atomic<bool>& cancel) {
+    if (cancel.load()) {
+        return {};
+    }
     if (!m_running || m_fileTransfer == nullptr || m_peers.empty()) {
         Logger::write("slave: cannot request clipboard files, running=" +
                       std::to_string(m_running ? 1 : 0) +
@@ -416,16 +427,19 @@ std::vector<FileEntry> SlaveNet::requestClipboardFiles() {
     }
 
     const uint64_t deadline = GetTickCount64() + 30000;
-    while (GetTickCount64() < deadline) {
+    while (!cancel.load() && GetTickCount64() < deadline) {
         if (m_fileTransfer->waitForReceive(token, 20)) {
             const FileTransferManager::ReceiveResult result =
                 m_fileTransfer->consumeReceiveResult();
             return result.success ? result.files : std::vector<FileEntry>{};
         }
-        // WM_RENDERFORMAT blocks the service loop, so keep KCP pumping here.
+        // The transfer worker is outside the Service loop, so keep KCP
+        // pumping while waiting for the source-side response.
         poll(GetTickCount64());
     }
-    Logger::write("slave: timed out waiting for clipboard files");
+    Logger::write(cancel.load()
+                      ? "slave: clipboard files request cancelled"
+                      : "slave: timed out waiting for clipboard files");
     return {};
 }
 

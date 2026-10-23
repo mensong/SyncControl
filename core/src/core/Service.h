@@ -6,11 +6,14 @@
 #include <json.hpp>
 #include <queue>
 #include <string>
+#include <thread>
 
 #include "ipc/IpcServer.h"
 #include "input/InputCapture.h"
 #include "clipboard/ClipboardMonitor.h"
 #include "clipboard/FileTransfer.h"
+#include "clipboard/TransferQueue.h"
+#include "core/ConfirmWindow.h"
 #include "layout/ScreenLayout.h"
 #include "net/MasterNet.h"
 #include "net/SlaveNet.h"
@@ -43,11 +46,26 @@ private:
     void handleClipboardSync(const std::string& fromPeerId, const std::string& toPeerId);
     void handleClipboardText(const std::string& fromPeerId, const std::string& utf8);
     void handleClipboardFiles(const std::string& fromPeerId,
+                              const std::string& originPeerId,
+                              uint32_t originClipboardSequence,
                               const std::vector<FileEntry>& files);
     void handleClipboardFilesRequest(const std::string& fromPeerId, const std::string& fromPeerIp);
+    void handleRemoteFilesBatch(const std::string& sourceId,
+                                const std::string& sourceIp,
+                                const std::string& originPeerId,
+                                uint32_t originClipboardSequence,
+                                const std::vector<FileEntry>& files);
+    std::vector<FileEntry> executeRemoteFileTransfer(const TransferQueue::Task& task,
+                                                     const std::atomic<bool>& cancel);
+    void handleTransferQueueEvent(const TransferQueue::Task& task);
+    ClipboardMonitor::RemotePasteResult gateRemotePaste(
+        const std::vector<FileEntry>& metadata);
+    void deliverCompletedFiles(uint64_t taskId);
+    void ignorePendingTransfer(uint64_t taskId);
+    bool isLocalPeerId(const std::string& peerId);
     void reauthenticatePeers();
-    std::vector<FileEntry> requestFilesForSlaveRender(const std::vector<FileEntry>& metadata);
-    std::vector<FileEntry> requestFilesForMasterRender(const std::vector<FileEntry>& metadata);
+    std::vector<FileEntry> requestRemoteFilesFromPeer(const std::string& peerId,
+                                                      const std::atomic<bool>& cancel);
     bool resolveMasterScreen(const ScreenLayout& layout, std::string& masterId) const;
     InputCapture::RouteTarget lookupRouteForCapture(const std::string& screenId,
                                                     Edge edge, float ratio);
@@ -58,6 +76,13 @@ private:
     std::unique_ptr<InputCapture> m_inputCapture;
     std::unique_ptr<ClipboardMonitor> m_clipboard;
     std::unique_ptr<FileTransferManager> m_fileTransfer;
+    std::unique_ptr<TransferQueue> m_transferQueue;
+    std::unique_ptr<ConfirmWindow> m_confirmWindow;
+    uint64_t m_pendingConfirmTaskId = 0;
+    std::string m_pendingConfirmOrigin;
+    uint32_t m_pendingConfirmSequence = 0;
+    std::string m_lastIgnoredOrigin;
+    uint32_t m_lastIgnoredSequence = 0;
     std::queue<nlohmann::json> m_ipcCommands;
     std::mutex m_stateMutex;
     std::mutex m_commandMutex;
@@ -72,6 +97,7 @@ private:
     std::string m_pendingClipboardTarget;
     std::string m_lastSentClipboardText;
     std::string m_filesClipboardSource;
+    std::thread::id m_serviceThreadId;
     bool m_running = false;
 };
 

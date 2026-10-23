@@ -107,6 +107,11 @@ void MasterNet::stop() {
     m_socket.close();
 }
 
+void MasterNet::setPeerId(const std::string& peerId) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
+    m_peerId = peerId.empty() ? "master" : peerId;
+}
+
 void MasterNet::reauthenticate() {
     std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     const uint64_t nowMs = GetTickCount64();
@@ -347,7 +352,9 @@ bool MasterNet::sendClipboardRequestTo(const std::string& peerId, bool files) {
 }
 
 bool MasterNet::sendFilesMetaTo(const std::string& peerId,
-                                const std::vector<FileEntry>& files) {
+                                const std::vector<FileEntry>& files,
+                                const std::string& originPeerId,
+                                uint32_t originClipboardSequence) {
     std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = findPeerById(peerId);
     if (peer == nullptr || !peer->connected || files.empty()) {
@@ -355,7 +362,9 @@ bool MasterNet::sendFilesMetaTo(const std::string& peerId,
                       ", count=" + std::to_string(files.size()));
         return false;
     }
-    const std::vector<uint8_t> payload = encodeFilesMeta(files);
+    const std::vector<uint8_t> payload = encodeFilesMeta(
+        files, originPeerId.empty() ? m_peerId : originPeerId,
+        originClipboardSequence);
     if (payload.size() > 0xFFFF) {  // protocol frame length is a u16
         Logger::write("master: clipboard files meta too large peer=" + peerId +
                       ", bytes=" + std::to_string(payload.size()));
@@ -611,11 +620,15 @@ void MasterNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) 
         }
         case MessageType::ClipboardFilesMeta: {
             std::vector<FileEntry> files;
-            if (decodeFilesMeta(message.payload, files) && !files.empty()) {
+            std::string originPeerId;
+            uint32_t originClipboardSequence = 0;
+            if (decodeFilesMeta(message.payload, files, originPeerId,
+                                originClipboardSequence) && !files.empty()) {
                 if (onClipboardFiles) {
                     Logger::write("master: received clipboard files meta peer=" +
                                   peer.id + ", count=" + std::to_string(files.size()));
-                    onClipboardFiles(peer.id, files);
+                    onClipboardFiles(peer.id, originPeerId, originClipboardSequence,
+                                     files);
                 }
             } else {
                 Logger::write("master: received invalid clipboard files meta peer=" +

@@ -261,7 +261,9 @@ bool decodeClipboardText(const std::vector<uint8_t>& payload, std::string& utf8)
     return true;
 }
 
-std::vector<uint8_t> encodeFilesMeta(const std::vector<FileEntry>& files) {
+std::vector<uint8_t> encodeFilesMeta(const std::vector<FileEntry>& files,
+                                     const std::string& originPeerId,
+                                     uint32_t originClipboardSequence) {
     json array = json::array();
     for (const FileEntry& entry : files) {
         array.push_back({
@@ -270,15 +272,27 @@ std::vector<uint8_t> encodeFilesMeta(const std::vector<FileEntry>& files) {
             {"dir", entry.isDir},
         });
     }
-    const json payload = {{"files", array}};
+    const json payload = {
+        {"files", array},
+        {"origin", originPeerId},
+        {"originSequence", originClipboardSequence},
+    };
     const std::string text = payload.dump();
     return std::vector<uint8_t>(text.begin(), text.end());
 }
 
-bool decodeFilesMeta(const std::vector<uint8_t>& payload, std::vector<FileEntry>& files) {
+bool decodeFilesMeta(const std::vector<uint8_t>& payload,
+                     std::vector<FileEntry>& files,
+                     std::string& originPeerId,
+                     uint32_t& originClipboardSequence) {
     files.clear();
+    originPeerId.clear();
+    originClipboardSequence = 0;
     try {
         const json value = json::parse(payload.begin(), payload.end());
+        originPeerId = value.value("origin", std::string());
+        const uint64_t sequence = value.value("originSequence", 0ULL);
+        originClipboardSequence = static_cast<uint32_t>(sequence);
         for (const json& item : value.at("files")) {
             FileEntry entry;
             entry.name = item.at("name").get<std::string>();

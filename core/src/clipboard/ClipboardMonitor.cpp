@@ -300,6 +300,10 @@ void ClipboardMonitor::clearRemoteClipboardState() {
         m_pendingRemoteFiles.clear();
     }
     {
+        std::lock_guard<std::mutex> lock(m_actionMutex);
+        m_actions.clear();
+    }
+    {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_cache = {};
     }
@@ -325,6 +329,10 @@ void ClipboardMonitor::stop() {
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
         m_pendingRemoteFiles.clear();
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_actionMutex);
+        m_actions.clear();
     }
     m_filesFormat = 0;
     m_expectedClipboardSequence = 0;
@@ -353,6 +361,23 @@ LRESULT ClipboardMonitor::handleMessage(HWND window, UINT message,
             return 0;
         case WM_RENDERFORMAT:
             return handleRenderFormat(static_cast<UINT>(wParam));
+        case kReinstallRemoteMessage:
+            reinstallPendingRemoteFiles();
+            return 0;
+        case kClipboardActionMessage: {
+            std::function<void()> action;
+            {
+                std::lock_guard<std::mutex> lock(m_actionMutex);
+                if (!m_actions.empty()) {
+                    action = std::move(m_actions.front());
+                    m_actions.erase(m_actions.begin());
+                }
+            }
+            if (action) {
+                action();
+            }
+            return 0;
+        }
         case WM_DESTROY:
             return 0;
         default:
@@ -362,6 +387,7 @@ LRESULT ClipboardMonitor::handleMessage(HWND window, UINT message,
 
 bool ClipboardMonitor::readClipboard(Snapshot& out) const {
     out = {};
+    out.clipboardSequence = GetClipboardSequenceNumber();
     if (!openClipboardWithRetry(m_window, "read local clipboard")) {
         return false;
     }
@@ -401,7 +427,9 @@ bool ClipboardMonitor::readClipboard(Snapshot& out) const {
 bool ClipboardMonitor::storeIfChanged(Snapshot&& snapshot) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (snapshot.state == m_cache.state && snapshot.text == m_cache.text &&
-        filesEqual(snapshot.files, m_cache.files)) {
+        filesEqual(snapshot.files, m_cache.files) &&
+        snapshot.originPeerId == m_cache.originPeerId &&
+        snapshot.originClipboardSequence == m_cache.originClipboardSequence) {
         return false;  // 某些软件高频重写相同内容，去重避免抖动
     }
     m_cache = std::move(snapshot);
@@ -419,6 +447,20 @@ bool ClipboardMonitor::refresh() {
 ClipboardMonitor::Snapshot ClipboardMonitor::snapshot() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     return m_cache;
+}
+
+void ClipboardMonitor::postClipboardAction(std::function<void()> action) {
+    if (!action || m_window == nullptr) {
+        return;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_actionMutex);
+        m_actions.push_back(std::move(action));
+    }
+    if (!PostMessageW(m_window, kClipboardActionMessage, 0, 0)) {
+        std::lock_guard<std::mutex> lock(m_actionMutex);
+        m_actions.clear();
+    }
 }
 
 bool ClipboardMonitor::setTextToClipboard(const std::string& utf8) {
@@ -450,7 +492,10 @@ bool ClipboardMonitor::setTextToClipboard(const std::string& utf8) {
     return ok;
 }
 
-bool ClipboardMonitor::setPendingFilesMeta(const std::vector<FileEntry>& files) {
+bool ClipboardMonitor::setPendingFilesMeta(
+    const std::vector<FileEntry>& files,
+    const std::string& originPeerId,
+    uint32_t originClipboardSequence) {
     if (m_window == nullptr || files.empty()) {
         Logger::write("clipboard: cannot install remote file metadata, windowValid=" +
                       std::to_string(m_window != nullptr ? 1 : 0) +
@@ -497,6 +542,8 @@ bool ClipboardMonitor::setPendingFilesMeta(const std::vector<FileEntry>& files) 
         Snapshot snapshot;
         snapshot.state = State::Files;
         snapshot.files = files;
+        snapshot.originPeerId = originPeerId;
+        snapshot.originClipboardSequence = originClipboardSequence;
         m_cache = std::move(snapshot);
     }
     rememberClipboardUpdate();
@@ -505,7 +552,10 @@ bool ClipboardMonitor::setPendingFilesMeta(const std::vector<FileEntry>& files) 
     return true;
 }
 
-bool ClipboardMonitor::setFilesToClipboard(const std::vector<FileEntry>& files) {
+bool ClipboardMonitor::setFilesToClipboard(
+    const std::vector<FileEntry>& files,
+    const std::string& originPeerId,
+    uint32_t originClipboardSequence) {
     if (m_window == nullptr || files.empty() ||
         !openClipboardWithRetry(m_window, "write downloaded files")) {
         return false;
@@ -532,9 +582,19 @@ bool ClipboardMonitor::setFilesToClipboard(const std::vector<FileEntry>& files) 
         Snapshot snapshot;
         snapshot.state = State::Files;
         snapshot.files = files;
+        snapshot.originPeerId = originPeerId;
+        snapshot.originClipboardSequence = originClipboardSequence;
         m_cache = std::move(snapshot);
     }
+    m_hasPendingRemoteFiles = false;
+    m_renderingFiles = false;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        m_pendingRemoteFiles.clear();
+    }
     rememberClipboardUpdate();
+    Logger::write("clipboard: installed downloaded files, count=" +
+                  std::to_string(files.size()));
     return true;
 }
 
@@ -543,8 +603,7 @@ void ClipboardMonitor::rememberClipboardUpdate() {
 }
 
 LRESULT ClipboardMonitor::handleRenderFormat(UINT format) {
-    if (format != CF_HDROP || !m_hasPendingRemoteFiles || m_renderingFiles ||
-        !m_fileRequest) {
+    if (format != CF_HDROP || !m_hasPendingRemoteFiles || m_renderingFiles) {
         return 0;
     }
 
@@ -559,17 +618,32 @@ LRESULT ClipboardMonitor::handleRenderFormat(UINT format) {
     }
 
     m_renderingFiles = true;
-    Logger::write("clipboard: paste requested file download, count=" +
+    Logger::write("clipboard: paste requested remote files, count=" +
                   std::to_string(metadata.size()));
-    std::vector<FileEntry> downloaded = m_fileRequest(metadata);
+    std::vector<FileEntry> downloaded;
+    bool ready = false;
+    if (m_pasteGate) {
+        const RemotePasteResult gate = m_pasteGate(metadata);
+        downloaded = gate.files;
+        const RemotePasteDecision decision = gate.decision;
+        ready = decision == RemotePasteDecision::Ready;
+        if (decision != RemotePasteDecision::Ready || downloaded.empty()) {
+            PostMessageW(m_window, kReinstallRemoteMessage, 0, 0);
+            m_renderingFiles = false;
+            return 0;
+        }
+    }
     m_renderingFiles = false;
+
+    if (!ready || downloaded.empty()) {
+        PostMessageW(m_window, kReinstallRemoteMessage, 0, 0);
+        return 0;
+    }
+
     m_hasPendingRemoteFiles = false;
     {
         std::lock_guard<std::mutex> lock(m_pendingMutex);
         m_pendingRemoteFiles.clear();
-    }
-    if (downloaded.empty()) {
-        return 0;
     }
 
     const HGLOBAL drop = allocHdrop(downloaded);
@@ -589,6 +663,20 @@ LRESULT ClipboardMonitor::handleRenderFormat(UINT format) {
     }
     rememberClipboardUpdate();
     return 0;
+}
+
+void ClipboardMonitor::reinstallPendingRemoteFiles() {
+    if (!m_hasPendingRemoteFiles) {
+        return;
+    }
+    std::vector<FileEntry> metadata;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        metadata = m_pendingRemoteFiles;
+    }
+    if (!metadata.empty()) {
+        setPendingFilesMeta(metadata);
+    }
 }
 
 }  // namespace synccontrol

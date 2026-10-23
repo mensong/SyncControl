@@ -53,6 +53,7 @@ public:
     bool start(const std::string& bindIp, const std::vector<PeerInit>& peers,
                uint16_t localPort);
     void stop();
+    void setPeerId(const std::string& peerId);
     void reauthenticate();
     void poll(uint64_t nowMs);
     bool isRunning() const { return m_running; }
@@ -79,13 +80,18 @@ public:
     bool sendSwitchOutFrom(const std::string& peerId);
     bool sendClipboardTextTo(const std::string& peerId, const std::string& utf8);
     bool sendClipboardRequestTo(const std::string& peerId, bool files = false);
-    bool sendFilesMetaTo(const std::string& peerId, const std::vector<FileEntry>& files);
+    bool sendFilesMetaTo(const std::string& peerId,
+                         const std::vector<FileEntry>& files,
+                         const std::string& originPeerId,
+                         uint32_t originClipboardSequence);
     void remapPeerIps(const std::vector<PeerInit>& peers);
     uint16_t peerFilePortByIp(const std::string& ip) const;
 
     // Fires on the Service poll thread when a peer answers CLIPBOARD_REQUEST.
     std::function<void(const std::string& fromPeerId, const std::string& utf8)> onClipboardText;
     std::function<void(const std::string& fromPeerId,
+                       const std::string& originPeerId,
+                       uint32_t originClipboardSequence,
                        const std::vector<FileEntry>& files)> onClipboardFiles;
     // files=true paste request from a peer. The callback supplies the target IP.
     std::function<void(const std::string& fromPeerId, const std::string& fromPeerIp)>

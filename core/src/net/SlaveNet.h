@@ -8,6 +8,8 @@
 #endif
 #include <WinSock2.h>
 
+#include <atomic>
+#include <functional>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -52,13 +54,20 @@ public:
     void setKcpOverride(const KcpParameters& parameters);
     void disconnectAll();
     MouseStats mouseStats() const;
+    void setRemoteFilesMetaHandler(
+        std::function<void(const std::string& originPeerId,
+                           uint32_t originClipboardSequence,
+                           const std::vector<FileEntry>& files)> handler) {
+        m_remoteFilesMeta = std::move(handler);
+    }
 
     std::vector<Peer>& peers() { return m_peers; }
     const std::vector<Peer>& peers() const { return m_peers; }
+    const std::string& peerId() const { return m_peerId; }
     void setClipboardMonitor(ClipboardMonitor* monitor) { m_clipboard = monitor; }
     void setFileTransfer(FileTransferManager* transfer) { m_fileTransfer = transfer; }
     // Target-side paste: asks Master for file data, waits for TCP completion.
-    std::vector<FileEntry> requestClipboardFiles();
+    std::vector<FileEntry> requestClipboardFiles(const std::atomic<bool>& cancel);
 
 private:
     Peer* findPeer(const sockaddr_in& endpoint);
@@ -70,7 +79,8 @@ private:
     void handleInputMessage(const Message& message);
     void handleMouseMove(Peer* peer, const Message& message);
     bool sendKcpFrame(Peer& peer, const Message& message);
-    void sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files);
+    void sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files,
+                       uint32_t originClipboardSequence);
     void sendHandshakeResponse(Peer& peer);
     void sendHeartbeat(Peer& peer);
     void sendSlaveHello();
@@ -80,6 +90,9 @@ private:
     mutable std::recursive_mutex m_networkMutex;
     InputInject m_input;
     ClipboardMonitor* m_clipboard = nullptr;
+    std::function<void(const std::string& originPeerId,
+                       uint32_t originClipboardSequence,
+                       const std::vector<FileEntry>& files)> m_remoteFilesMeta;
     FileTransferManager* m_fileTransfer = nullptr;
     bool m_inputActive = false;
     bool m_running = false;
