@@ -14,6 +14,7 @@
 #include "clipboard/FileTransfer.h"
 #include "clipboard/TransferQueue.h"
 #include "core/ConfirmWindow.h"
+#include "core/TransferProgressWindow.h"
 #include "layout/ScreenLayout.h"
 #include "net/MasterNet.h"
 #include "net/SlaveNet.h"
@@ -62,6 +63,7 @@ private:
         const std::vector<FileEntry>& metadata);
     void deliverCompletedFiles(uint64_t taskId);
     void ignorePendingTransfer(uint64_t taskId);
+    void handleTransferProgress(const FileTransferManager::Status& status);
     bool isLocalPeerId(const std::string& peerId);
     void reauthenticatePeers();
     std::vector<FileEntry> requestRemoteFilesFromPeer(const std::string& peerId,
@@ -78,6 +80,7 @@ private:
     std::unique_ptr<FileTransferManager> m_fileTransfer;
     std::unique_ptr<TransferQueue> m_transferQueue;
     std::unique_ptr<ConfirmWindow> m_confirmWindow;
+    std::unique_ptr<TransferProgressWindow> m_progressWindow;
     uint64_t m_pendingConfirmTaskId = 0;
     std::string m_pendingConfirmOrigin;
     uint32_t m_pendingConfirmSequence = 0;

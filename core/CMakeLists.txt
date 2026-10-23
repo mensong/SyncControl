@@ -23,6 +23,7 @@ add_executable(SyncControlCore
     src/net/SlaveNet.cpp
     src/core/Service.cpp
     src/core/ConfirmWindow.cpp
+    src/core/TransferProgressWindow.cpp
     src/core/Security.cpp
     src/core/Logger.cpp
     src/core/TrayIcon.cpp
@@ -52,4 +53,4 @@ if(MSVC)
         "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
 endif()
 
-target_link_libraries(SyncControlCore PRIVATE ws2_32 user32 shell32 bcrypt advapi32)
+target_link_libraries(SyncControlCore PRIVATE ws2_32 user32 shell32 bcrypt advapi32 comctl32)

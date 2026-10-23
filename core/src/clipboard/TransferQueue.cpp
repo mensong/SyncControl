@@ -209,6 +209,20 @@ TransferQueue::CompletedFiles TransferQueue::takeCompletedFiles(uint64_t taskId)
     return {};
 }
 
+TransferQueue::QueueStats TransferQueue::stats() const {
+    QueueStats result;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const Task& task : m_tasks) {
+        if (task.state == State::Active) {
+            ++result.activeCount;
+        } else if (task.state == State::Queued) {
+            ++result.queuedCount;
+        }
+    }
+    result.remainingCount = result.activeCount + result.queuedCount;
+    return result;
+}
+
 TransferQueue::Task* TransferQueue::findTaskLocked(uint64_t taskId) {
     for (Task& task : m_tasks) {
         if (task.id == taskId) {

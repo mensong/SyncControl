@@ -59,6 +59,12 @@ public:
         uint32_t originClipboardSequence = 0;
     };
 
+    struct QueueStats {
+        size_t activeCount = 0;
+        size_t queuedCount = 0;
+        size_t remainingCount = 0;
+    };
+
     struct PasteDecision {
         enum class Action { Reject, Wait, Ready };
 
@@ -90,6 +96,7 @@ public:
     bool cancel(uint64_t taskId);
     PasteDecision decidePaste(const std::vector<FileEntry>& metadata) const;
     CompletedFiles takeCompletedFiles(uint64_t taskId);
+    QueueStats stats() const;
 
 private:
     Task* findTaskLocked(uint64_t taskId);

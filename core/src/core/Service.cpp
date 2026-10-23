@@ -224,6 +224,8 @@ Service::Service() {
             ignorePendingTransfer(taskId);
         });
     m_confirmWindow->ensureCreated();
+    m_progressWindow = std::make_unique<TransferProgressWindow>();
+    m_progressWindow->ensureCreated();
     m_transferQueue->start(
         [this](const TransferQueue::Task& task, const std::atomic<bool>& cancel) {
             return executeRemoteFileTransfer(task, cancel);
@@ -235,6 +237,9 @@ Service::Service() {
 
 Service::~Service() {
     stopMode();
+    if (m_fileTransfer) {
+        m_fileTransfer->setProgressHandler(nullptr);
+    }
     if (m_ipc) {
         m_ipc->stop();
     }
@@ -322,6 +327,9 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
     if (!m_fileTransfer) {
         m_fileTransfer = std::make_unique<FileTransferManager>();
     }
+    m_fileTransfer->setProgressHandler([this](const FileTransferManager::Status& status) {
+        handleTransferProgress(status);
+    });
     if (!m_fileTransfer->start(bindIp.empty() ? "0.0.0.0" : bindIp,
                                localPort != 0 ? localPort : 19881)) {
         m_master->stop();
@@ -454,6 +462,9 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
     if (!m_fileTransfer) {
         m_fileTransfer = std::make_unique<FileTransferManager>();
     }
+    m_fileTransfer->setProgressHandler([this](const FileTransferManager::Status& status) {
+        handleTransferProgress(status);
+    });
     if (!m_fileTransfer->start("0.0.0.0", localPort != 0 ? localPort : 19881)) {
         m_role = "idle";
         std::cerr << "start_slave: file transfer listener failed\n";
@@ -504,6 +515,9 @@ void Service::stopMode() {
     if (m_confirmWindow) {
         m_confirmWindow->hide();
     }
+    if (m_progressWindow) {
+        m_progressWindow->hide();
+    }
     if (m_inputCapture) {
         m_inputCapture->stop();
     }
@@ -515,6 +529,7 @@ void Service::stopMode() {
     }
     if (m_fileTransfer) {
         m_fileTransfer->stop();
+        m_fileTransfer->setProgressHandler(nullptr);
     }
     if (m_clipboard) {
         m_clipboard->clearRemoteClipboardState();
@@ -851,6 +866,31 @@ void Service::ignorePendingTransfer(uint64_t taskId) {
     if (m_transferQueue && taskId != 0) {
         m_transferQueue->cancel(taskId);
     }
+}
+
+void Service::handleTransferProgress(const FileTransferManager::Status& status) {
+    if (m_progressWindow == nullptr) {
+        return;
+    }
+    if (!status.active) {
+        m_progressWindow->hide();
+        return;
+    }
+
+    TransferProgressWindow::Snapshot snapshot;
+    snapshot.active = true;
+    snapshot.fileName = status.fileName;
+    snapshot.fileIndex = status.fileIndex;
+    snapshot.fileCount = status.fileCount;
+    snapshot.fileTransferred = status.fileTransferred;
+    snapshot.fileTotal = status.fileTotal;
+    snapshot.batchTransferred = status.transferred;
+    snapshot.batchTotal = status.total;
+    if (m_transferQueue != nullptr) {
+        const TransferQueue::QueueStats stats = m_transferQueue->stats();
+        snapshot.queueRemaining = stats.remainingCount;
+    }
+    m_progressWindow->update(snapshot);
 }
 
 bool Service::isLocalPeerId(const std::string& peerId) {

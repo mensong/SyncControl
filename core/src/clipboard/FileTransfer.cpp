@@ -294,6 +294,12 @@ bool sendFilesOverTcp(const std::vector<FileEntry>& files, const std::string& ip
     }
 
     uint64_t sentTotal = 0;
+    if (progress) {
+        TransferProgress start;
+        start.fileCount = files.size();
+        start.batchTotal = totalBytes;
+        progress(start);
+    }
     for (size_t index = 0; index < files.size(); ++index) {
         if (cancel.load()) {
             Logger::write("file transfer: send to " + ip + ":" + std::to_string(port) +
@@ -311,6 +317,15 @@ bool sendFilesOverTcp(const std::vector<FileEntry>& files, const std::string& ip
             return false;
         }
         if (entry.isDir) {
+            if (progress) {
+                TransferProgress entryProgress;
+                entryProgress.fileName = entry.name;
+                entryProgress.fileIndex = index + 1;
+                entryProgress.fileCount = files.size();
+                entryProgress.batchTransferred = sentTotal;
+                entryProgress.batchTotal = totalBytes;
+                progress(entryProgress);
+            }
             continue;
         }
 
@@ -328,6 +343,16 @@ bool sendFilesOverTcp(const std::vector<FileEntry>& files, const std::string& ip
         std::vector<uint8_t> buffer(kChunkSize);
         uint64_t offset = 0;
         bool ok = true;
+        if (progress) {
+            TransferProgress fileStart;
+            fileStart.fileName = entry.name;
+            fileStart.fileIndex = index + 1;
+            fileStart.fileCount = files.size();
+            fileStart.fileTotal = entry.size;
+            fileStart.batchTransferred = sentTotal;
+            fileStart.batchTotal = totalBytes;
+            progress(fileStart);
+        }
         while (offset < entry.size) {
             if (cancel.load()) {
                 Logger::write("file transfer: send to " + ip + ":" + std::to_string(port) +
@@ -359,7 +384,15 @@ bool sendFilesOverTcp(const std::vector<FileEntry>& files, const std::string& ip
             offset += bytesRead;
             sentTotal += bytesRead;
             if (progress) {
-                progress(entry.name, sentTotal, totalBytes);
+                TransferProgress chunkProgress;
+                chunkProgress.fileName = entry.name;
+                chunkProgress.fileIndex = index + 1;
+                chunkProgress.fileCount = files.size();
+                chunkProgress.fileTransferred = offset;
+                chunkProgress.fileTotal = entry.size;
+                chunkProgress.batchTransferred = sentTotal;
+                chunkProgress.batchTotal = totalBytes;
+                progress(chunkProgress);
             }
         }
         CloseHandle(file);
@@ -414,6 +447,12 @@ bool receiveFilesOverTcp(TcpFileChannel& channel, const std::wstring& destRoot,
     };
 
     uint64_t receivedTotal = 0;
+    if (progress) {
+        TransferProgress start;
+        start.fileCount = fileCount;
+        start.batchTotal = totalBytes;
+        progress(start);
+    }
     for (uint32_t index = 0; index < fileCount; ++index) {
         if (cancel.load()) {
             return fail();
@@ -444,6 +483,16 @@ bool receiveFilesOverTcp(TcpFileChannel& channel, const std::wstring& destRoot,
         }
         const bool isDir = meta[0] != 0;
         const uint64_t size = getU64(meta, 1);
+        if (progress) {
+            TransferProgress metaProgress;
+            metaProgress.fileName = name;
+            metaProgress.fileIndex = index + 1;
+            metaProgress.fileCount = fileCount;
+            metaProgress.fileTotal = size;
+            metaProgress.batchTransferred = receivedTotal;
+            metaProgress.batchTotal = totalBytes;
+            progress(metaProgress);
+        }
 
         std::vector<std::wstring> parts;
         if (!sanitizeRelativeName(name, parts)) {
@@ -530,7 +579,15 @@ bool receiveFilesOverTcp(TcpFileChannel& channel, const std::wstring& destRoot,
             written += chunkLen;
             receivedTotal += chunkLen;
             if (progress) {
-                progress(name, receivedTotal, totalBytes);
+                TransferProgress chunkProgress;
+                chunkProgress.fileName = name;
+                chunkProgress.fileIndex = index + 1;
+                chunkProgress.fileCount = fileCount;
+                chunkProgress.fileTransferred = written;
+                chunkProgress.fileTotal = size;
+                chunkProgress.batchTransferred = receivedTotal;
+                chunkProgress.batchTotal = totalBytes;
+                progress(chunkProgress);
             }
             if (last && written < size) {
                 ok = false;
@@ -637,9 +694,8 @@ void FileTransferManager::sendAsync(std::vector<FileEntry> files, const std::str
     trackWorker(std::thread([this, files = std::move(files), ip, port, cancel]() {
         const bool success =
             sendFilesOverTcp(files, ip, port, *cancel,
-                             [this](const std::string& fileName, uint64_t transferred,
-                                    uint64_t total) {
-                                 updateStatus(true, fileName, transferred, total);
+                             [this](const TransferProgress& progress) {
+                                 updateStatus(true, progress);
                              });
         Logger::write("file transfer: send " +
                       std::string(success ? "completed" : "failed") + " to " + ip + ":" +
@@ -728,9 +784,8 @@ void FileTransferManager::receiveSession(SOCKET socket,
     std::vector<FileEntry> files;
     const bool success =
         receiveFilesOverTcp(channel, clipboardTempRoot(), files, cancel,
-                            [this](const std::string& fileName, uint64_t transferred,
-                                   uint64_t total) {
-                                updateStatus(true, fileName, transferred, total);
+                            [this](const TransferProgress& progress) {
+                                updateStatus(true, progress);
                             });
     {
         std::lock_guard<std::mutex> lock(m_resultMutex);
@@ -739,20 +794,47 @@ void FileTransferManager::receiveSession(SOCKET socket,
     }
     Logger::write(std::string("file transfer: receive ") +
                   (success ? "completed" : "failed"));
-    if (!success) {
-        updateStatus(false, {}, 0, 0);
-    }
+    updateStatus(false, {}, 0, 0);
     m_completedCount.fetch_add(1);
     m_sessionBusy.store(false);
 }
 
 void FileTransferManager::updateStatus(bool active, const std::string& fileName,
                                        uint64_t transferred, uint64_t total) {
+    TransferProgress progress;
+    progress.fileName = active ? fileName : std::string();
+    progress.batchTransferred = active ? transferred : 0;
+    progress.batchTotal = active ? total : 0;
+    updateStatus(active, progress);
+}
+
+void FileTransferManager::updateStatus(bool active, const TransferProgress& progress) {
+    Status next;
+    next.active = active;
+    next.fileName = active ? progress.fileName : std::string();
+    next.fileIndex = active ? progress.fileIndex : 0;
+    next.fileCount = active ? progress.fileCount : 0;
+    next.fileTransferred = active ? progress.fileTransferred : 0;
+    next.fileTotal = active ? progress.fileTotal : 0;
+    next.transferred = active ? progress.batchTransferred : 0;
+    next.total = active ? progress.batchTotal : 0;
     std::lock_guard<std::mutex> lock(m_statusMutex);
-    m_status.active = active;
-    m_status.fileName = fileName;
-    m_status.transferred = transferred;
-    m_status.total = total;
+    m_status = next;
+
+    std::function<void(const Status&)> handler;
+    {
+        std::lock_guard<std::mutex> handlerLock(m_progressHandlerMutex);
+        handler = m_progressHandler;
+    }
+    if (handler) {
+        handler(next);
+    }
+}
+
+void FileTransferManager::setProgressHandler(
+    std::function<void(const Status&)> handler) {
+    std::lock_guard<std::mutex> lock(m_progressHandlerMutex);
+    m_progressHandler = std::move(handler);
 }
 
 void FileTransferManager::trackWorker(std::thread worker) {

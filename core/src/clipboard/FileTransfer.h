@@ -23,7 +23,17 @@
 namespace synccontrol {
 
 using TransferProgressFn =
-    std::function<void(const std::string& fileName, uint64_t transferred, uint64_t total)>;
+    std::function<void(const struct TransferProgress& progress)>;
+
+struct TransferProgress {
+    std::string fileName;
+    uint64_t fileIndex = 0;
+    uint64_t fileCount = 0;
+    uint64_t fileTransferred = 0;
+    uint64_t fileTotal = 0;
+    uint64_t batchTransferred = 0;
+    uint64_t batchTotal = 0;
+};
 
 // Wire-level session: sender connects, streams a session header, per-file
 // headers, and 64KB data chunks, then a footer. Both helpers block and must
@@ -43,6 +53,10 @@ public:
     struct Status {
         bool active = false;
         std::string fileName;
+        uint64_t fileIndex = 0;
+        uint64_t fileCount = 0;
+        uint64_t fileTransferred = 0;
+        uint64_t fileTotal = 0;
         uint64_t transferred = 0;
         uint64_t total = 0;
     };
@@ -62,6 +76,7 @@ public:
     void relayAsync(const std::string& targetIp, uint16_t targetPort);
 
     Status status() const;
+    void setProgressHandler(std::function<void(const Status&)> handler);
 
     // Render waits: capture the completion counter, then wait for it to grow.
     uint64_t beginReceiveWait() const;
@@ -80,6 +95,7 @@ private:
     void unregisterActiveCancel(const std::shared_ptr<std::atomic<bool>>& cancel);
     void updateStatus(bool active, const std::string& fileName, uint64_t transferred,
                       uint64_t total);
+    void updateStatus(bool active, const TransferProgress& progress);
     void trackWorker(std::thread worker);
 
     TcpFileChannel m_listener;
@@ -92,6 +108,8 @@ private:
     std::vector<std::shared_ptr<std::atomic<bool>>> m_activeCancels;
     mutable std::mutex m_statusMutex;
     Status m_status;
+    std::function<void(const Status&)> m_progressHandler;
+    mutable std::mutex m_progressHandlerMutex;
     std::atomic<uint64_t> m_completedCount{0};
     mutable std::mutex m_resultMutex;
     ReceiveResult m_lastResult;
