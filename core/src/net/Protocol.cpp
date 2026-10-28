@@ -31,6 +31,43 @@ int16_t getI16(const uint8_t* data, size_t offset) {
     return static_cast<int16_t>(getU16(data, offset));
 }
 
+void putU32(std::vector<uint8_t>& output, uint32_t value) {
+    output.push_back(static_cast<uint8_t>(value & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 8) & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 16) & 0xFF));
+    output.push_back(static_cast<uint8_t>((value >> 24) & 0xFF));
+}
+
+uint32_t getU32(const uint8_t* data, size_t offset) {
+    return static_cast<uint32_t>(data[offset]) |
+           (static_cast<uint32_t>(data[offset + 1]) << 8) |
+           (static_cast<uint32_t>(data[offset + 2]) << 16) |
+           (static_cast<uint32_t>(data[offset + 3]) << 24);
+}
+
+void appendBlob16(std::vector<uint8_t>& output, const uint8_t* data,
+                  uint16_t bytes) {
+    putU16(output, bytes);
+    if (bytes > 0) {
+        output.insert(output.end(), data, data + bytes);
+    }
+}
+
+bool readBlob16(const std::vector<uint8_t>& payload, size_t& offset,
+                const uint8_t*& data, uint16_t& bytes) {
+    if (offset + 2 > payload.size()) {
+        return false;
+    }
+    bytes = getU16(payload.data(), offset);
+    offset += 2;
+    if (offset + bytes > payload.size()) {
+        return false;
+    }
+    data = payload.data() + offset;
+    offset += bytes;
+    return true;
+}
+
 }  // namespace
 
 std::vector<uint8_t> serializeMessage(const Message& message) {
@@ -353,6 +390,120 @@ bool decodeClipboardRequest(const std::vector<uint8_t>& payload, bool& files) {
     } catch (...) {
         return false;
     }
+}
+
+std::vector<uint8_t> encodeClipboardImageMeta(const ClipboardImageMeta& meta) {
+    if (meta.transferId.empty()) {
+        return {};
+    }
+    const json payload = {
+        {"transferId", meta.transferId},
+        {"width", meta.width},
+        {"height", meta.height},
+        {"bytes", meta.totalBytes},
+        {"origin", meta.originPeerId},
+        {"originSequence", meta.originClipboardSequence},
+    };
+    const std::string text = payload.dump();
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+bool decodeClipboardImageMeta(const std::vector<uint8_t>& payload,
+                              ClipboardImageMeta& meta) {
+    meta = {};
+    try {
+        const json value = json::parse(payload.begin(), payload.end());
+        meta.transferId = value.at("transferId").get<std::string>();
+        meta.width = value.value("width", 0U);
+        meta.height = value.value("height", 0U);
+        meta.totalBytes = value.value("bytes", 0U);
+        meta.originPeerId = value.value("origin", std::string());
+        const uint64_t sequence = value.value("originSequence", 0ULL);
+        meta.originClipboardSequence = static_cast<uint32_t>(sequence);
+    } catch (...) {
+        return false;
+    }
+    return !meta.transferId.empty() && meta.width > 0 && meta.height > 0 &&
+           meta.totalBytes > 0 && meta.totalBytes <= kMaxClipboardImageBytes;
+}
+
+std::vector<uint8_t> encodeClipboardImageRequest(const std::string& transferId) {
+    if (transferId.empty()) {
+        return {};
+    }
+    const json payload = {{"transferId", transferId}};
+    const std::string text = payload.dump();
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+bool decodeClipboardImageRequest(const std::vector<uint8_t>& payload,
+                                 std::string& transferId) {
+    transferId.clear();
+    try {
+        const json value = json::parse(payload.begin(), payload.end());
+        transferId = value.at("transferId").get<std::string>();
+    } catch (...) {
+        return false;
+    }
+    return !transferId.empty() && transferId.size() <= 128;
+}
+
+std::vector<uint8_t> encodeClipboardRichMeta(const ClipboardRichMeta& meta) {
+    if (meta.transferId.empty()) {
+        return {};
+    }
+    const json payload = {
+        {"transferId", meta.transferId},
+        {"kind", meta.kind == ClipboardRichKind::Rtf ? "rtf" : "html"},
+        {"richBytes", meta.richBytes},
+        {"textBytes", meta.companionTextBytes},
+        {"origin", meta.originPeerId},
+        {"originSequence", meta.originClipboardSequence},
+    };
+    const std::string text = payload.dump();
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+bool decodeClipboardRichMeta(const std::vector<uint8_t>& payload,
+                             ClipboardRichMeta& meta) {
+    meta = {};
+    try {
+        const json value = json::parse(payload.begin(), payload.end());
+        meta.transferId = value.at("transferId").get<std::string>();
+        meta.kind = value.value("kind", std::string()) == "rtf"
+                        ? ClipboardRichKind::Rtf
+                        : ClipboardRichKind::Html;
+        meta.richBytes = value.value("richBytes", 0ULL);
+        meta.companionTextBytes = value.value("textBytes", 0ULL);
+        meta.originPeerId = value.value("origin", std::string());
+        const uint64_t sequence = value.value("originSequence", 0ULL);
+        meta.originClipboardSequence = static_cast<uint32_t>(sequence);
+    } catch (...) {
+        return false;
+    }
+    return !meta.transferId.empty() && meta.richBytes > 0 &&
+           meta.richBytes <= kMaxClipboardRichBytes;
+}
+
+std::vector<uint8_t> encodeClipboardRichRequest(const std::string& transferId) {
+    if (transferId.empty()) {
+        return {};
+    }
+    const json payload = {{"transferId", transferId}};
+    const std::string text = payload.dump();
+    return std::vector<uint8_t>(text.begin(), text.end());
+}
+
+bool decodeClipboardRichRequest(const std::vector<uint8_t>& payload,
+                                std::string& transferId) {
+    transferId.clear();
+    try {
+        const json value = json::parse(payload.begin(), payload.end());
+        transferId = value.at("transferId").get<std::string>();
+    } catch (...) {
+        return false;
+    }
+    return !transferId.empty() && transferId.size() <= 128;
 }
 
 std::vector<uint8_t> encodeSlaveHello(const std::string& hostname,

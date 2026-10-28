@@ -3,6 +3,7 @@
 #include <Windows.h>
 
 #include <algorithm>
+#include <fstream>
 #include <json.hpp>
 
 #include "core/Logger.h"
@@ -167,7 +168,93 @@ void SlaveNet::stop() {
     m_running = false;
     m_inputActive = false;
     m_peers.clear();
+    m_clipboardImages.clear();
+    m_clipboardRich.clear();
     m_socket.close();
+}
+
+std::string nextClipboardImageId() {
+    static uint64_t counter = 0;
+    return "img-" + std::to_string(GetTickCount64()) + "-" +
+           std::to_string(++counter);
+}
+
+bool saveClipboardImageFile(const std::string& transferId,
+                            const std::vector<uint8_t>& png,
+                            std::string& path) {
+    char root[MAX_PATH]{};
+    const UINT length = GetEnvironmentVariableA("LOCALAPPDATA", root, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return false;
+    }
+    const std::string base = std::string(root, length) + "\\SyncControl";
+    if (!CreateDirectoryA(base.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    if (!CreateDirectoryA((base + "\\clipboard").c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    const std::string images = base + "\\clipboard\\images";
+    if (!CreateDirectoryA(images.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    path = images + "\\" + transferId + ".png";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+    file.write(reinterpret_cast<const char*>(png.data()),
+               static_cast<std::streamsize>(png.size()));
+    return static_cast<bool>(file);
+}
+
+std::string nextClipboardRichId() {
+    static uint64_t counter = 0;
+    return "syncctl-rich-" + std::to_string(GetTickCount64()) + "-" +
+           std::to_string(++counter);
+}
+
+std::string richExtension(ClipboardRichKind kind) {
+    return kind == ClipboardRichKind::Rtf ? ".rtf" : ".html";
+}
+
+bool clipboardRichDirectory(std::string& directory) {
+    char root[MAX_PATH]{};
+    const UINT length = GetEnvironmentVariableA("LOCALAPPDATA", root, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return false;
+    }
+    const std::string base = std::string(root, length) + "\\SyncControl";
+    if (!CreateDirectoryA(base.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    if (!CreateDirectoryA((base + "\\clipboard").c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    directory = base + "\\clipboard\\rich";
+    if (!CreateDirectoryA(directory.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    return true;
+}
+
+bool writeClipboardRichFile(const std::string& path,
+                            const std::vector<uint8_t>& bytes) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+    if (!bytes.empty()) {
+        file.write(reinterpret_cast<const char*>(bytes.data()),
+                   static_cast<std::streamsize>(bytes.size()));
+    }
+    return static_cast<bool>(file);
 }
 
 SlaveNet::Peer* SlaveNet::findPeer(const sockaddr_in& endpoint) {
@@ -362,6 +449,26 @@ void SlaveNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) {
             }
             break;
         }
+        case MessageType::ClipboardImageMeta: {
+            ClipboardImageMeta meta;
+            if (decodeClipboardImageMeta(message.payload, meta)) {
+                handleClipboardImageMeta(meta);
+            } else {
+                Logger::write("slave: received invalid clipboard image meta, bytes=" +
+                              std::to_string(message.payload.size()));
+            }
+            break;
+        }
+        case MessageType::ClipboardRichMeta: {
+            ClipboardRichMeta meta;
+            if (decodeClipboardRichMeta(message.payload, meta)) {
+                handleClipboardRichMeta(meta);
+            } else {
+                Logger::write("slave: received invalid clipboard rich meta, bytes=" +
+                              std::to_string(message.payload.size()));
+            }
+            break;
+        }
         case MessageType::ClipboardRequest: {
             bool files = false;
             if (!decodeClipboardRequest(message.payload, files)) {
@@ -397,6 +504,29 @@ void SlaveNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) {
                     sendKcpFrame(peer, {MessageType::ClipboardText,
                                         encodeClipboardText(snapshot.text)});
                 }
+                if (snapshot.state == ClipboardMonitor::State::Image &&
+                    !snapshot.pngData.empty()) {
+                    sendClipboardImageMeta(peer, snapshot);
+                } else if ((snapshot.state == ClipboardMonitor::State::Html &&
+                            !snapshot.htmlData.empty()) ||
+                           (snapshot.state == ClipboardMonitor::State::Rtf &&
+                            !snapshot.rtfData.empty())) {
+                    sendClipboardRichMeta(peer, snapshot);
+                }
+            }
+            break;
+        }
+        case MessageType::ClipboardImageRequest: {
+            std::string transferId;
+            if (decodeClipboardImageRequest(message.payload, transferId)) {
+                serveClipboardImageRequest(peer, transferId);
+            }
+            break;
+        }
+        case MessageType::ClipboardRichRequest: {
+            std::string transferId;
+            if (decodeClipboardRichRequest(message.payload, transferId)) {
+                serveClipboardRichRequest(peer, transferId);
             }
             break;
         }
@@ -461,6 +591,188 @@ void SlaveNet::sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files,
     }
 }
 
+void SlaveNet::handleClipboardImageMeta(const ClipboardImageMeta& meta) {
+    if (m_remoteImageMeta) {
+        Logger::write("slave: received clipboard image meta, transferId=" +
+                      meta.transferId + ", bytes=" +
+                      std::to_string(meta.totalBytes));
+        m_remoteImageMeta(meta);
+        return;
+    }
+    Logger::write("slave: clipboard image meta has no handler, transferId=" +
+                  meta.transferId);
+}
+
+void SlaveNet::handleClipboardRichMeta(const ClipboardRichMeta& meta) {
+    if (m_remoteRichMeta) {
+        Logger::write("slave: received clipboard rich meta, transferId=" +
+                      meta.transferId + ", bytes=" +
+                      std::to_string(meta.richBytes));
+        m_remoteRichMeta(meta);
+        return;
+    }
+    Logger::write("slave: clipboard rich meta has no handler, transferId=" +
+                  meta.transferId);
+}
+
+void SlaveNet::sendClipboardImageMeta(
+    Peer& peer, const ClipboardMonitor::Snapshot& snapshot) {
+    if (snapshot.pngData.empty() ||
+        snapshot.pngData.size() > kMaxClipboardImageBytes) {
+        Logger::write("slave: clipboard image rejected, bytes=" +
+                      std::to_string(snapshot.pngData.size()) +
+                      ", limit=" + std::to_string(kMaxClipboardImageBytes));
+        return;
+    }
+
+    ClipboardImageMeta meta;
+    meta.transferId = nextClipboardImageId();
+    meta.width = snapshot.imageWidth;
+    meta.height = snapshot.imageHeight;
+    meta.totalBytes = static_cast<uint32_t>(snapshot.pngData.size());
+    meta.originPeerId = snapshot.originPeerId.empty()
+                            ? m_peerId
+                            : snapshot.originPeerId;
+    meta.originClipboardSequence =
+        snapshot.originPeerId.empty()
+            ? snapshot.clipboardSequence
+            : snapshot.originClipboardSequence;
+    if (!saveClipboardImageFile(meta.transferId, snapshot.pngData,
+                                m_clipboardImages[meta.transferId].path)) {
+        m_clipboardImages.erase(meta.transferId);
+        Logger::write("slave: failed to save clipboard image cache, transferId=" +
+                      meta.transferId);
+        return;
+    }
+    m_clipboardImages[meta.transferId].width = meta.width;
+    m_clipboardImages[meta.transferId].height = meta.height;
+    m_clipboardImages[meta.transferId].bytes = meta.totalBytes;
+
+    const std::vector<uint8_t> payload = encodeClipboardImageMeta(meta);
+    if (sendKcpFrame(peer, {MessageType::ClipboardImageMeta,
+                            std::move(payload)})) {
+        peer.kcp->flush();
+        Logger::write("slave: sent clipboard image meta peer=" + peer.id +
+                      ", transferId=" + meta.transferId +
+                      ", bytes=" + std::to_string(meta.totalBytes));
+    }
+}
+
+void SlaveNet::sendClipboardRichMeta(
+    Peer& peer, const ClipboardMonitor::Snapshot& snapshot) {
+    const std::vector<uint8_t>& richData =
+        snapshot.state == ClipboardMonitor::State::Rtf
+            ? snapshot.rtfData
+            : snapshot.htmlData;
+    if (richData.empty() || richData.size() > kMaxClipboardRichBytes) {
+        Logger::write("slave: clipboard rich content rejected, bytes=" +
+                      std::to_string(richData.size()) +
+                      ", limit=" + std::to_string(kMaxClipboardRichBytes));
+        return;
+    }
+
+    std::string directory;
+    if (!clipboardRichDirectory(directory)) {
+        Logger::write("slave: cannot resolve clipboard rich cache directory");
+        return;
+    }
+
+    ClipboardRichMeta meta;
+    meta.transferId = nextClipboardRichId();
+    meta.kind = snapshot.state == ClipboardMonitor::State::Rtf
+                    ? ClipboardRichKind::Rtf
+                    : ClipboardRichKind::Html;
+    meta.richBytes = richData.size();
+    meta.companionTextBytes = snapshot.text.size();
+    meta.originPeerId = snapshot.originPeerId.empty()
+                            ? m_peerId
+                            : snapshot.originPeerId;
+    meta.originClipboardSequence =
+        snapshot.originPeerId.empty()
+            ? snapshot.clipboardSequence
+            : snapshot.originClipboardSequence;
+
+    CachedRich& cache = m_clipboardRich[meta.transferId];
+    cache.kind = meta.kind;
+    cache.richPath = directory + "\\" + meta.transferId +
+                     richExtension(meta.kind);
+    cache.textPath = directory + "\\" + meta.transferId + ".txt";
+    cache.richBytes = meta.richBytes;
+    cache.textBytes = meta.companionTextBytes;
+    const std::vector<uint8_t> textData(snapshot.text.begin(),
+                                        snapshot.text.end());
+    if (!writeClipboardRichFile(cache.richPath, richData) ||
+        !writeClipboardRichFile(cache.textPath, textData)) {
+        m_clipboardRich.erase(meta.transferId);
+        Logger::write("slave: failed to save clipboard rich cache, transferId=" +
+                      meta.transferId);
+        return;
+    }
+
+    const std::vector<uint8_t> payload = encodeClipboardRichMeta(meta);
+    if (sendKcpFrame(peer, {MessageType::ClipboardRichMeta,
+                            std::move(payload)})) {
+        peer.kcp->flush();
+        Logger::write("slave: sent clipboard rich meta peer=" + peer.id +
+                      ", transferId=" + meta.transferId +
+                      ", bytes=" + std::to_string(meta.richBytes));
+    }
+}
+
+void SlaveNet::serveClipboardImageRequest(Peer& peer,
+                                          const std::string& transferId) {
+    if (m_fileTransfer == nullptr) {
+        Logger::write("slave: cannot serve clipboard image, no file transfer");
+        return;
+    }
+    auto image = m_clipboardImages.find(transferId);
+    if (image == m_clipboardImages.end()) {
+        Logger::write("slave: unknown clipboard image request, transferId=" +
+                      transferId);
+        return;
+    }
+
+    FileEntry entry;
+    entry.path = image->second.path;
+    entry.name = transferId + ".png";
+    entry.size = image->second.bytes;
+    Logger::write("slave: sending clipboard image peer=" + peer.id +
+                  ", transferId=" + transferId + ", bytes=" +
+                  std::to_string(entry.size));
+    m_fileTransfer->sendAsync({entry}, endpointAddressToString(peer.endpoint),
+                              m_masterPort);
+}
+
+void SlaveNet::serveClipboardRichRequest(Peer& peer,
+                                         const std::string& transferId) {
+    if (m_fileTransfer == nullptr) {
+        Logger::write("slave: cannot serve clipboard rich content, no file transfer");
+        return;
+    }
+
+    auto rich = m_clipboardRich.find(transferId);
+    if (rich == m_clipboardRich.end()) {
+        Logger::write("slave: unknown clipboard rich request, transferId=" +
+                      transferId);
+        return;
+    }
+
+    FileEntry richEntry;
+    richEntry.path = rich->second.richPath;
+    richEntry.name = transferId + richExtension(rich->second.kind);
+    richEntry.size = rich->second.richBytes;
+    FileEntry textEntry;
+    textEntry.path = rich->second.textPath;
+    textEntry.name = transferId + ".txt";
+    textEntry.size = rich->second.textBytes;
+    Logger::write("slave: sending clipboard rich content peer=" + peer.id +
+                  ", transferId=" + transferId +
+                  ", bytes=" + std::to_string(richEntry.size + textEntry.size));
+    m_fileTransfer->sendAsync({richEntry, textEntry},
+                              endpointAddressToString(peer.endpoint),
+                              m_masterPort);
+}
+
 std::vector<FileEntry> SlaveNet::requestClipboardFiles(
     const std::atomic<bool>& cancel) {
     if (cancel.load()) {
@@ -504,6 +816,102 @@ std::vector<FileEntry> SlaveNet::requestClipboardFiles(
     Logger::write(cancel.load()
                       ? "slave: clipboard files request cancelled"
                       : "slave: timed out waiting for clipboard files");
+    return {};
+}
+
+std::vector<FileEntry> SlaveNet::requestClipboardImage(
+    const std::string& transferId, const std::atomic<bool>& cancel) {
+    if (cancel.load() || transferId.empty()) {
+        return {};
+    }
+    if (!m_running || m_fileTransfer == nullptr || m_peers.empty()) {
+        Logger::write("slave: cannot request clipboard image, running=" +
+                      std::to_string(m_running ? 1 : 0) +
+                      ", fileTransfer=" +
+                      std::to_string(m_fileTransfer != nullptr ? 1 : 0) +
+                      ", peers=" + std::to_string(m_peers.size()));
+        return {};
+    }
+
+    const uint64_t token = m_fileTransfer->beginReceiveWait();
+    bool sent = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
+        if (!m_peers.empty()) {
+            Peer& peer = m_peers.front();
+            sent = sendKcpFrame(peer,
+                                {MessageType::ClipboardImageRequest,
+                                 encodeClipboardImageRequest(transferId)});
+            if (sent && peer.kcp) {
+                peer.kcp->flush();
+            }
+        }
+    }
+    if (!sent) {
+        Logger::write("slave: failed to send clipboard image request, transferId=" +
+                      transferId);
+        return {};
+    }
+
+    const uint64_t deadline = GetTickCount64() + 30000;
+    while (!cancel.load() && GetTickCount64() < deadline) {
+        if (m_fileTransfer->waitForReceive(token, 20)) {
+            const FileTransferManager::ReceiveResult result =
+                m_fileTransfer->consumeReceiveResult();
+            return result.success ? result.files : std::vector<FileEntry>{};
+        }
+    }
+    Logger::write(cancel.load()
+                      ? "slave: clipboard image request cancelled"
+                      : "slave: timed out waiting for clipboard image");
+    return {};
+}
+
+std::vector<FileEntry> SlaveNet::requestClipboardRich(
+    const std::string& transferId, const std::atomic<bool>& cancel) {
+    if (cancel.load() || transferId.empty()) {
+        return {};
+    }
+    if (!m_running || m_fileTransfer == nullptr || m_peers.empty()) {
+        Logger::write("slave: cannot request clipboard rich content, running=" +
+                      std::to_string(m_running ? 1 : 0) +
+                      ", fileTransfer=" +
+                      std::to_string(m_fileTransfer != nullptr ? 1 : 0) +
+                      ", peers=" + std::to_string(m_peers.size()));
+        return {};
+    }
+
+    const uint64_t token = m_fileTransfer->beginReceiveWait();
+    bool sent = false;
+    {
+        std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
+        if (!m_peers.empty()) {
+            Peer& peer = m_peers.front();
+            sent = sendKcpFrame(peer,
+                                {MessageType::ClipboardRichRequest,
+                                 encodeClipboardRichRequest(transferId)});
+            if (sent && peer.kcp) {
+                peer.kcp->flush();
+            }
+        }
+    }
+    if (!sent) {
+        Logger::write("slave: failed to send clipboard rich request, transferId=" +
+                      transferId);
+        return {};
+    }
+
+    const uint64_t deadline = GetTickCount64() + 30000;
+    while (!cancel.load() && GetTickCount64() < deadline) {
+        if (m_fileTransfer->waitForReceive(token, 20)) {
+            const FileTransferManager::ReceiveResult result =
+                m_fileTransfer->consumeReceiveResult();
+            return result.success ? result.files : std::vector<FileEntry>{};
+        }
+    }
+    Logger::write(cancel.load()
+                      ? "slave: clipboard rich request cancelled"
+                      : "slave: timed out waiting for clipboard rich content");
     return {};
 }
 

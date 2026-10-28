@@ -51,5 +51,7 @@ public:
 
 std::string endpointToString(const sockaddr_in& endpoint);
 std::string endpointAddressToString(const sockaddr_in& endpoint);
+// Resolves a numeric IPv4 address or a hostname to an IPv4 address.
+bool resolveHostIpv4(const std::string& host, in_addr& address);
 
 }  // namespace synccontrol

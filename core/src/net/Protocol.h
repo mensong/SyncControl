@@ -25,6 +25,10 @@ enum class MessageType : uint16_t {
     ClipboardFilesMeta = 0x41,
     ClipboardFileData = 0x42,
     ClipboardRequest = 0x43,
+    ClipboardImageMeta = 0x44,
+    ClipboardRichMeta = 0x45,
+    ClipboardRichRequest = 0x46,
+    ClipboardImageRequest = 0x47,
 
     // Slave-initiated discovery. A configured peer can still use the original
     // master-initiated KCP handshake; this makes an unconfigured slave show up.
@@ -174,6 +178,54 @@ bool decodeFilesMeta(const std::vector<uint8_t>& payload,
 // an empty payload is the legacy "send me your clipboard content" request.
 std::vector<uint8_t> encodeClipboardRequest(bool files);
 bool decodeClipboardRequest(const std::vector<uint8_t>& payload, bool& files);
+
+// Clipboard image bytes never traverse KCP. Switching screens sends only this
+// lightweight metadata; the receiver confirms it and then pulls the PNG over
+// the same TCP file-transfer channel used by clipboard files.
+constexpr uint32_t kMaxClipboardImageBytes = 8u * 1024u * 1024u;
+
+struct ClipboardImageMeta {
+    std::string transferId;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t totalBytes = 0;
+    std::string originPeerId;
+    uint32_t originClipboardSequence = 0;
+};
+
+std::vector<uint8_t> encodeClipboardImageMeta(const ClipboardImageMeta& meta);
+bool decodeClipboardImageMeta(const std::vector<uint8_t>& payload,
+                              ClipboardImageMeta& meta);
+
+std::vector<uint8_t> encodeClipboardImageRequest(const std::string& transferId);
+bool decodeClipboardImageRequest(const std::vector<uint8_t>& payload,
+                                 std::string& transferId);
+
+// Rich clipboard bytes also use the TCP transfer channel. KCP carries only
+// enough metadata to show the confirmation window and request the content.
+enum class ClipboardRichKind : uint8_t {
+    Html = 0,
+    Rtf = 1,
+};
+
+constexpr uint32_t kMaxClipboardRichBytes = 32u * 1024u * 1024u;
+
+struct ClipboardRichMeta {
+    std::string transferId;
+    ClipboardRichKind kind = ClipboardRichKind::Html;
+    uint64_t richBytes = 0;
+    uint64_t companionTextBytes = 0;
+    std::string originPeerId;
+    uint32_t originClipboardSequence = 0;
+};
+
+std::vector<uint8_t> encodeClipboardRichMeta(const ClipboardRichMeta& meta);
+bool decodeClipboardRichMeta(const std::vector<uint8_t>& payload,
+                             ClipboardRichMeta& meta);
+
+std::vector<uint8_t> encodeClipboardRichRequest(const std::string& transferId);
+bool decodeClipboardRichRequest(const std::vector<uint8_t>& payload,
+                                std::string& transferId);
 
 std::vector<uint8_t> encodeSlaveHello(const std::string& hostname,
                                       uint16_t filePort,

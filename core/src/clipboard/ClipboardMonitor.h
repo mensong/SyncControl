@@ -22,7 +22,7 @@ namespace synccontrol {
 // the cache itself is mutex-guarded because IPC status reads cross threads.
 class ClipboardMonitor {
 public:
-    enum class State { Empty, Text, Files };
+    enum class State { Empty, Text, Files, Image, Html, Rtf };
 
     struct Snapshot {
         State state = State::Empty;
@@ -30,6 +30,14 @@ public:
         // Local snapshots carry source paths; a pending remote snapshot has
         // empty paths until the TCP transfer completes.
         std::vector<FileEntry> files;
+        // PNG payload for Image state; dimensions are in pixels.
+        std::vector<uint8_t> pngData;
+        uint32_t imageWidth = 0;
+        uint32_t imageHeight = 0;
+        // Raw "HTML Format"/"Rich Text Format" clipboard bytes. The existing
+        // text field carries the companion plain text when present.
+        std::vector<uint8_t> htmlData;
+        std::vector<uint8_t> rtfData;
         uint32_t clipboardSequence = 0;
         std::string originPeerId;
         uint32_t originClipboardSequence = 0;
@@ -54,6 +62,14 @@ public:
 
     // Writes UTF-8 text to the system clipboard as CF_UNICODETEXT.
     bool setTextToClipboard(const std::string& utf8);
+    // Writes a PNG image as CF_DIB plus the registered PNG formats.
+    bool setImageToClipboard(const std::vector<uint8_t>& png);
+    // Writes raw "HTML Format" bytes with an optional plain-text companion.
+    bool setHtmlToClipboard(const std::vector<uint8_t>& html,
+                            const std::string& companionTextUtf8 = {});
+    // Writes raw "Rich Text Format" bytes with an optional plain-text companion.
+    bool setRtfToClipboard(const std::vector<uint8_t>& rtf,
+                           const std::string& companionTextUtf8 = {});
     // Installs delayed-render CF_HDROP data after receiving file metadata.
     bool setPendingFilesMeta(const std::vector<FileEntry>& files,
                              const std::string& originPeerId = {},
@@ -86,6 +102,11 @@ private:
     void readClipboardOrigin(Snapshot& out) const;
     bool storeIfChanged(Snapshot&& snapshot);
     void rememberClipboardUpdate();
+    bool readImageFromClipboard(Snapshot& out) const;
+    bool readRawFormatFromClipboard(UINT format, std::vector<uint8_t>& bytes) const;
+    void installRemoteSnapshot(State state,
+                               const std::vector<uint8_t>& richBytes,
+                               const std::string& companionTextUtf8);
 
     HWND m_window = nullptr;
     ATOM m_classAtom = 0;
@@ -98,6 +119,11 @@ private:
     std::vector<std::function<void()>> m_actions;
     UINT m_filesFormat = 0;
     UINT m_originFormat = 0;
+    UINT m_pngFormat = 0;
+    UINT m_imagePngFormat = 0;
+    UINT m_htmlFormat = 0;
+    UINT m_rtfFormat = 0;
+    ULONG_PTR m_gdiplusToken = 0;
     DWORD m_expectedClipboardSequence = 0;
     bool m_hasPendingRemoteFiles = false;
     bool m_renderingFiles = false;

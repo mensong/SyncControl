@@ -54,12 +54,15 @@ public partial class ScreenNode : ObservableObject
     private double _height = 180;
 
     [ObservableProperty]
+    [property: JsonIgnore]
     private bool _isMaster;
 
     [ObservableProperty]
+    [property: JsonIgnore]
     private ConnectionStatus _connectionStatus = ConnectionStatus.Offline;
 
     [ObservableProperty]
+    [property: JsonIgnore]
     private int _latencyMs = -1;
 
     partial void OnLatencyMsChanged(int value)

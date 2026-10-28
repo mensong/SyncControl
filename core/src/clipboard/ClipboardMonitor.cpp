@@ -3,7 +3,11 @@
 #include <shellapi.h>
 #include <shlobj_core.h>
 
+#include <objbase.h>
+#include <objidl.h>
+
 #include <cstring>
+#include <gdiplus.h>
 #include <json.hpp>
 #include <string>
 #include <vector>
@@ -52,6 +56,261 @@ std::string wideToUtf8(const wchar_t* data, int chars) {
 
 std::string wideToUtf8(const std::wstring& value) {
     return wideToUtf8(value.data(), static_cast<int>(value.size()));
+}
+
+bool ensureGdiplusStarted(ULONG_PTR& token) {
+    if (token != 0) {
+        return true;
+    }
+    Gdiplus::GdiplusStartupInput input;
+    if (Gdiplus::GdiplusStartup(&token, &input, nullptr) != Gdiplus::Ok) {
+        token = 0;
+        return false;
+    }
+    return true;
+}
+
+CLSID pngEncoderClsid() {
+    CLSID clsid{};
+    UINT count = 0;
+    UINT savedBytes = 0;
+    if (Gdiplus::GetImageEncodersSize(&count, &savedBytes) != Gdiplus::Ok ||
+        count == 0 || savedBytes == 0) {
+        return clsid;
+    }
+    std::vector<uint8_t> buffer(static_cast<size_t>(count) *
+                                sizeof(Gdiplus::ImageCodecInfo) + savedBytes);
+    auto* codecs = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+    if (Gdiplus::GetImageEncoders(count, savedBytes, codecs) != Gdiplus::Ok) {
+        return clsid;
+    }
+    for (UINT index = 0; index < count; ++index) {
+        if (wcscmp(codecs[index].MimeType, L"image/png") == 0) {
+            clsid = codecs[index].Clsid;
+            break;
+        }
+    }
+    return clsid;
+}
+
+void trimPngToIEnd(std::vector<uint8_t>& png) {
+    static const uint8_t kIEnd[8] = {'I', 'E', 'N', 'D', 0xAE, 0x42, 0x60, 0x82};
+    if (png.size() < 8) {
+        return;
+    }
+    for (size_t offset = png.size() - 8;; --offset) {
+        if (memcmp(png.data() + offset, kIEnd, 8) == 0) {
+            png.resize(offset + 8);
+            return;
+        }
+        if (offset == 0) {
+            return;
+        }
+    }
+}
+
+bool parsePngDimensions(const std::vector<uint8_t>& png, uint32_t& width,
+                        uint32_t& height) {
+    static const uint8_t kPngMagic[8] = {0x89, 'P', 'N', 'G',
+                                         0x0D, 0x0A, 0x1A, 0x0A};
+    if (png.size() < 24 || memcmp(png.data(), kPngMagic, 8) != 0) {
+        return false;
+    }
+    width = (static_cast<uint32_t>(png[16]) << 24) |
+            (static_cast<uint32_t>(png[17]) << 16) |
+            (static_cast<uint32_t>(png[18]) << 8) |
+            static_cast<uint32_t>(png[19]);
+    height = (static_cast<uint32_t>(png[20]) << 24) |
+             (static_cast<uint32_t>(png[21]) << 16) |
+             (static_cast<uint32_t>(png[22]) << 8) |
+             static_cast<uint32_t>(png[23]);
+    return width > 0 && height > 0;
+}
+
+// Converts a clipboard CF_DIB/CF_DIBV5 blob to lossless PNG via GDI+.
+bool dibToPng(const void* dib, size_t dibBytes, std::vector<uint8_t>& png,
+              ULONG_PTR gdiplusToken) {
+    png.clear();
+    if (!ensureGdiplusStarted(gdiplusToken) || dib == nullptr ||
+        dibBytes < sizeof(BITMAPINFOHEADER)) {
+        return false;
+    }
+    const auto* info = static_cast<const BITMAPINFO*>(dib);
+    const BITMAPINFOHEADER& header = info->bmiHeader;
+    if (header.biWidth <= 0 || header.biHeight == 0) {
+        return false;
+    }
+    DWORD paletteEntries = header.biClrUsed;
+    if (paletteEntries == 0 && header.biBitCount <= 8) {
+        paletteEntries = 1u << header.biBitCount;
+    }
+    // Legacy 40-byte headers store the bitfield masks after the palette;
+    // V5 headers embed them, so only the legacy layout needs the extra skip.
+    const size_t maskBytes =
+        (header.biCompression == BI_BITFIELDS &&
+         header.biSize == sizeof(BITMAPINFOHEADER))
+            ? 3 * sizeof(DWORD) : 0;
+    const size_t bitsOffset =
+        header.biSize + static_cast<size_t>(paletteEntries) * sizeof(RGBQUAD) +
+        maskBytes;
+    if (dibBytes <= bitsOffset) {
+        return false;
+    }
+    void* bits = const_cast<uint8_t*>(static_cast<const uint8_t*>(dib)) +
+                 bitsOffset;
+    Gdiplus::Bitmap* bitmap = Gdiplus::Bitmap::FromBITMAPINFO(info, bits);
+    if (bitmap == nullptr) {
+        return false;
+    }
+    bool ok = false;
+    IStream* stream = nullptr;
+    if (CreateStreamOnHGlobal(nullptr, TRUE, &stream) == S_OK) {
+        const CLSID encoder = pngEncoderClsid();
+        if (bitmap->Save(stream, &encoder, nullptr) == Gdiplus::Ok) {
+            HGLOBAL global = nullptr;
+            if (GetHGlobalFromStream(stream, &global) == S_OK) {
+                const SIZE_T bytes = GlobalSize(global);
+                const void* data = GlobalLock(global);
+                if (data != nullptr && bytes > 0) {
+                    png.assign(static_cast<const uint8_t*>(data),
+                               static_cast<const uint8_t*>(data) + bytes);
+                    GlobalUnlock(global);
+                    ok = true;
+                }
+            }
+        }
+        stream->Release();
+    }
+    delete bitmap;
+    if (ok) {
+        trimPngToIEnd(png);
+    } else {
+        png.clear();
+    }
+    return ok && !png.empty();
+}
+
+// Decodes PNG into a 32bpp top-down CF_DIB blob (header + pixels).
+bool pngToDib32(const std::vector<uint8_t>& png, std::vector<uint8_t>& dib,
+                uint32_t& width, uint32_t& height, ULONG_PTR gdiplusToken) {
+    dib.clear();
+    width = 0;
+    height = 0;
+    if (!ensureGdiplusStarted(gdiplusToken) || png.empty()) {
+        return false;
+    }
+    HGLOBAL source = GlobalAlloc(GMEM_MOVEABLE, png.size());
+    if (source == nullptr) {
+        return false;
+    }
+    void* sourceData = GlobalLock(source);
+    if (sourceData == nullptr) {
+        GlobalFree(source);
+        return false;
+    }
+    memcpy(sourceData, png.data(), png.size());
+    GlobalUnlock(source);
+    IStream* stream = nullptr;
+    if (CreateStreamOnHGlobal(source, TRUE, &stream) != S_OK) {
+        GlobalFree(source);
+        return false;
+    }
+    Gdiplus::Bitmap bitmap(stream, FALSE);
+    stream->Release();
+    if (bitmap.GetLastStatus() != Gdiplus::Ok) {
+        return false;
+    }
+    width = bitmap.GetWidth();
+    height = bitmap.GetHeight();
+    if (width == 0 || height == 0) {
+        return false;
+    }
+    HBITMAP hbitmap = nullptr;
+    if (bitmap.GetHBITMAP(Gdiplus::Color(255, 255, 255, 255), &hbitmap) !=
+            Gdiplus::Ok ||
+        hbitmap == nullptr) {
+        return false;
+    }
+    const HDC hdc = GetDC(nullptr);
+    BITMAPINFO info{};
+    info.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    info.bmiHeader.biWidth = static_cast<LONG>(width);
+    info.bmiHeader.biHeight = -static_cast<LONG>(height);
+    info.bmiHeader.biPlanes = 1;
+    info.bmiHeader.biBitCount = 32;
+    info.bmiHeader.biCompression = BI_RGB;
+    info.bmiHeader.biSizeImage = width * height * 4;
+    std::vector<uint8_t> pixels(info.bmiHeader.biSizeImage);
+    const int lines = GetDIBits(hdc, hbitmap, 0, static_cast<UINT>(height),
+                                pixels.data(), &info, DIB_RGB_COLORS);
+    ReleaseDC(nullptr, hdc);
+    DeleteObject(hbitmap);
+    if (lines != static_cast<int>(height)) {
+        return false;
+    }
+    dib.resize(sizeof(BITMAPINFOHEADER) + pixels.size());
+    memcpy(dib.data(), &info.bmiHeader, sizeof(BITMAPINFOHEADER));
+    memcpy(dib.data() + sizeof(BITMAPINFOHEADER), pixels.data(), pixels.size());
+    return true;
+}
+
+HGLOBAL allocRawBlob(const void* data, size_t bytes) {
+    if (data == nullptr || bytes == 0) {
+        return nullptr;
+    }
+    const HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+    void* target = GlobalLock(handle);
+    if (target == nullptr) {
+        GlobalFree(handle);
+        return nullptr;
+    }
+    memcpy(target, data, bytes);
+    GlobalUnlock(handle);
+    return handle;
+}
+
+HGLOBAL allocWideTextBlob(const std::wstring& value) {
+    const SIZE_T bytes = (value.size() + 1) * sizeof(wchar_t);
+    const HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+    if (handle == nullptr) {
+        return nullptr;
+    }
+    void* target = GlobalLock(handle);
+    if (target == nullptr) {
+        GlobalFree(handle);
+        return nullptr;
+    }
+    memcpy(target, value.c_str(), bytes);
+    GlobalUnlock(handle);
+    return handle;
+}
+
+// Requires an already-open clipboard.
+std::string readUnicodeTextFromClipboard() {
+    if (!IsClipboardFormatAvailable(CF_UNICODETEXT)) {
+        return {};
+    }
+    const HANDLE handle = GetClipboardData(CF_UNICODETEXT);
+    if (handle == nullptr) {
+        return {};
+    }
+    const SIZE_T bytes = GlobalSize(handle);
+    const auto* text = static_cast<const wchar_t*>(
+        GlobalLock(static_cast<HGLOBAL>(handle)));
+    std::string result;
+    if (text != nullptr && bytes >= sizeof(wchar_t)) {
+        const size_t length = wcsnlen(text, bytes / sizeof(wchar_t));
+        if (length > 0) {
+            result = wideToUtf8(text, static_cast<int>(length));
+        }
+    }
+    if (text != nullptr) {
+        GlobalUnlock(static_cast<HGLOBAL>(handle));
+    }
+    return result;
 }
 
 bool openClipboardWithRetry(HWND owner, const char* operation) {
@@ -275,6 +534,21 @@ bool ClipboardMonitor::start() {
     if (m_originFormat == 0) {
         m_originFormat = RegisterClipboardFormatW(L"SyncControl.ClipboardOrigin");
     }
+    if (m_pngFormat == 0) {
+        m_pngFormat = RegisterClipboardFormatW(L"PNG");
+    }
+    if (m_imagePngFormat == 0) {
+        m_imagePngFormat = RegisterClipboardFormatW(L"image/png");
+    }
+    if (m_htmlFormat == 0) {
+        m_htmlFormat = RegisterClipboardFormatW(L"HTML Format");
+    }
+    if (m_rtfFormat == 0) {
+        m_rtfFormat = RegisterClipboardFormatW(L"Rich Text Format");
+    }
+    if (m_gdiplusToken == 0 && !ensureGdiplusStarted(m_gdiplusToken)) {
+        Logger::write("clipboard: gdiplus startup failed, image sync disabled");
+    }
     if (m_window == nullptr) {
         const DWORD messageWindowError = GetLastError();
         Logger::write("clipboard: message-only window creation failed, win32Error=" +
@@ -332,6 +606,10 @@ void ClipboardMonitor::stop() {
         UnregisterClassW(MAKEINTRESOURCEW(m_classAtom), GetModuleHandleW(nullptr));
         m_classAtom = 0;
     }
+    if (m_gdiplusToken != 0) {
+        Gdiplus::GdiplusShutdown(m_gdiplusToken);
+        m_gdiplusToken = 0;
+    }
     if (s_instance == this) {
         s_instance = nullptr;
     }
@@ -349,6 +627,10 @@ void ClipboardMonitor::stop() {
     }
     m_filesFormat = 0;
     m_originFormat = 0;
+    m_pngFormat = 0;
+    m_imagePngFormat = 0;
+    m_htmlFormat = 0;
+    m_rtfFormat = 0;
     m_expectedClipboardSequence = 0;
     m_hasPendingRemoteFiles = false;
     m_renderingFiles = false;
@@ -413,25 +695,40 @@ bool ClipboardMonitor::readClipboard(Snapshot& out) const {
             out.files = buildFileEntries(static_cast<HDROP>(handle));
             readClipboardOrigin(out);
         }
+    } else if (readImageFromClipboard(out)) {
+        // readImageFromClipboard fills state, PNG payload, and dimensions.
+    } else if (m_htmlFormat != 0 &&
+               readRawFormatFromClipboard(m_htmlFormat, out.htmlData)) {
+        out.state = State::Html;
+        out.text = readUnicodeTextFromClipboard();
+    } else if (m_rtfFormat != 0 &&
+               readRawFormatFromClipboard(m_rtfFormat, out.rtfData)) {
+        out.state = State::Rtf;
+        out.text = readUnicodeTextFromClipboard();
     } else if (IsClipboardFormatAvailable(CF_UNICODETEXT)) {
-        const HANDLE handle = GetClipboardData(CF_UNICODETEXT);
-        if (handle != nullptr) {
-            const SIZE_T bytes = GlobalSize(handle);
-            const auto* text = static_cast<const wchar_t*>(
-                GlobalLock(static_cast<HGLOBAL>(handle)));
-            if (text != nullptr && bytes >= sizeof(wchar_t)) {
-                const size_t length = wcsnlen(text, bytes / sizeof(wchar_t));
-                if (length > 0) {
-                    out.state = State::Text;
-                    out.text = wideToUtf8(text, static_cast<int>(length));
-                }
-            }
-            if (text != nullptr) {
-                GlobalUnlock(static_cast<HGLOBAL>(handle));
-            }
+        const std::string text = readUnicodeTextFromClipboard();
+        if (!text.empty()) {
+            out.state = State::Text;
+            out.text = text;
         }
     }
     CloseClipboard();
+    if (out.state == State::Image) {
+        Logger::write("clipboard: detected local image, bytes=" +
+                      std::to_string(out.pngData.size()) + ", size=" +
+                      std::to_string(out.imageWidth) + "x" +
+                      std::to_string(out.imageHeight));
+    } else if (out.state == State::Html) {
+        Logger::write("clipboard: detected local html, bytes=" +
+                      std::to_string(out.htmlData.size()) +
+                      ", companionText=" +
+                      std::to_string(out.text.size()));
+    } else if (out.state == State::Rtf) {
+        Logger::write("clipboard: detected local rtf, bytes=" +
+                      std::to_string(out.rtfData.size()) +
+                      ", companionText=" +
+                      std::to_string(out.text.size()));
+    }
     if (out.state == State::Files && !out.files.empty()) {
         Logger::write("clipboard: detected local files, count=" +
                       std::to_string(out.files.size()));
@@ -474,10 +771,97 @@ void ClipboardMonitor::readClipboardOrigin(Snapshot& out) const {
     GlobalUnlock(static_cast<HGLOBAL>(handle));
 }
 
+bool ClipboardMonitor::readImageFromClipboard(Snapshot& out) const {
+    for (const UINT format : {m_pngFormat, m_imagePngFormat}) {
+        std::vector<uint8_t> png;
+        if (format != 0 && readRawFormatFromClipboard(format, png) &&
+            parsePngDimensions(png, out.imageWidth, out.imageHeight)) {
+            trimPngToIEnd(png);
+            out.pngData = std::move(png);
+            out.state = State::Image;
+            return true;
+        }
+    }
+    for (const UINT format : {static_cast<UINT>(CF_DIBV5), static_cast<UINT>(CF_DIB)}) {
+        if (!IsClipboardFormatAvailable(format)) {
+            continue;
+        }
+        const HANDLE handle = GetClipboardData(format);
+        if (handle == nullptr) {
+            continue;
+        }
+        const SIZE_T bytes = GlobalSize(handle);
+        const void* data = GlobalLock(static_cast<HGLOBAL>(handle));
+        std::vector<uint8_t> png;
+        const bool converted =
+            data != nullptr && dibToPng(data, bytes, png, m_gdiplusToken);
+        if (data != nullptr) {
+            GlobalUnlock(static_cast<HGLOBAL>(handle));
+        }
+        if (converted &&
+            parsePngDimensions(png, out.imageWidth, out.imageHeight)) {
+            out.pngData = std::move(png);
+            out.state = State::Image;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool ClipboardMonitor::readRawFormatFromClipboard(UINT format,
+                                                  std::vector<uint8_t>& bytes) const {
+    bytes.clear();
+    if (format == 0 || !IsClipboardFormatAvailable(format)) {
+        return false;
+    }
+    const HANDLE handle = GetClipboardData(format);
+    if (handle == nullptr) {
+        return false;
+    }
+    const SIZE_T size = GlobalSize(handle);
+    const void* data = GlobalLock(static_cast<HGLOBAL>(handle));
+    if (data == nullptr || size == 0) {
+        if (data != nullptr) {
+            GlobalUnlock(static_cast<HGLOBAL>(handle));
+        }
+        return false;
+    }
+    bytes.assign(static_cast<const uint8_t*>(data),
+                 static_cast<const uint8_t*>(data) + size);
+    GlobalUnlock(static_cast<HGLOBAL>(handle));
+    return !bytes.empty();
+}
+
+void ClipboardMonitor::installRemoteSnapshot(
+    State state, const std::vector<uint8_t>& richBytes,
+    const std::string& companionTextUtf8) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    Snapshot snapshot;
+    snapshot.state = state;
+    snapshot.text = companionTextUtf8;
+    switch (state) {
+        case State::Html:
+            snapshot.htmlData = richBytes;
+            break;
+        case State::Rtf:
+            snapshot.rtfData = richBytes;
+            break;
+        default:
+            break;
+    }
+    snapshot.clipboardSequence = GetClipboardSequenceNumber();
+    m_cache = std::move(snapshot);
+}
+
 bool ClipboardMonitor::storeIfChanged(Snapshot&& snapshot) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (snapshot.state == m_cache.state && snapshot.text == m_cache.text &&
         filesEqual(snapshot.files, m_cache.files) &&
+        snapshot.pngData == m_cache.pngData &&
+        snapshot.imageWidth == m_cache.imageWidth &&
+        snapshot.imageHeight == m_cache.imageHeight &&
+        snapshot.htmlData == m_cache.htmlData &&
+        snapshot.rtfData == m_cache.rtfData &&
         snapshot.originPeerId == m_cache.originPeerId &&
         snapshot.originClipboardSequence == m_cache.originClipboardSequence) {
         return false;  // 某些软件高频重写相同内容，去重避免抖动
@@ -521,12 +905,11 @@ bool ClipboardMonitor::setTextToClipboard(const std::string& utf8) {
 
     bool ok = false;
     if (EmptyClipboard()) {
-        const SIZE_T bytes = (wide.size() + 1) * sizeof(wchar_t);
-        const HGLOBAL handle = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        const HGLOBAL handle = allocWideTextBlob(wide);
         if (handle != nullptr) {
             void* target = GlobalLock(handle);
             if (target != nullptr) {
-                memcpy(target, wide.c_str(), bytes);
+                memcpy(target, wide.c_str(), (wide.size() + 1) * sizeof(wchar_t));
                 GlobalUnlock(handle);
                 if (SetClipboardData(CF_UNICODETEXT, handle) != nullptr) {
                     ok = true;
@@ -540,6 +923,137 @@ bool ClipboardMonitor::setTextToClipboard(const std::string& utf8) {
     }
     CloseClipboard();
     return ok;
+}
+
+bool ClipboardMonitor::setImageToClipboard(const std::vector<uint8_t>& png) {
+    std::vector<uint8_t> dib;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    if (png.empty() ||
+        !pngToDib32(png, dib, width, height, m_gdiplusToken)) {
+        Logger::write("clipboard: failed to decode remote png for clipboard, bytes=" +
+                      std::to_string(png.size()));
+        return false;
+    }
+    if (!openClipboardWithRetry(m_window, "write clipboard image")) {
+        return false;
+    }
+
+    bool ok = false;
+    if (EmptyClipboard()) {
+        const HGLOBAL dibHandle = allocRawBlob(dib.data(), dib.size());
+        if (dibHandle != nullptr &&
+            SetClipboardData(CF_DIB, dibHandle) != nullptr) {
+            ok = true;
+            for (const UINT format : {m_pngFormat, m_imagePngFormat}) {
+                if (format == 0) {
+                    continue;
+                }
+                const HGLOBAL pngHandle = allocRawBlob(png.data(), png.size());
+                if (pngHandle != nullptr &&
+                    SetClipboardData(format, pngHandle) == nullptr) {
+                    GlobalFree(pngHandle);
+                }
+            }
+        } else if (dibHandle != nullptr) {
+            GlobalFree(dibHandle);
+        }
+    }
+    CloseClipboard();
+    if (!ok) {
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        Snapshot snapshot;
+        snapshot.state = State::Image;
+        snapshot.pngData = png;
+        snapshot.imageWidth = width;
+        snapshot.imageHeight = height;
+        snapshot.clipboardSequence = GetClipboardSequenceNumber();
+        m_cache = std::move(snapshot);
+    }
+    rememberClipboardUpdate();
+    Logger::write("clipboard: installed remote image, bytes=" +
+                  std::to_string(png.size()) + ", size=" +
+                  std::to_string(width) + "x" + std::to_string(height));
+    return true;
+}
+
+bool ClipboardMonitor::setHtmlToClipboard(const std::vector<uint8_t>& html,
+                                          const std::string& companionTextUtf8) {
+    if (html.empty() || m_htmlFormat == 0 ||
+        !openClipboardWithRetry(m_window, "write clipboard html")) {
+        return false;
+    }
+
+    bool ok = false;
+    if (EmptyClipboard()) {
+        const HGLOBAL handle = allocRawBlob(html.data(), html.size());
+        if (handle != nullptr) {
+            if (SetClipboardData(m_htmlFormat, handle) != nullptr) {
+                ok = true;
+                if (!companionTextUtf8.empty()) {
+                    const HGLOBAL textHandle =
+                        allocWideTextBlob(utf8ToWide(companionTextUtf8));
+                    if (textHandle != nullptr &&
+                        SetClipboardData(CF_UNICODETEXT, textHandle) == nullptr) {
+                        GlobalFree(textHandle);
+                    }
+                }
+            } else {
+                GlobalFree(handle);
+            }
+        }
+    }
+    CloseClipboard();
+    if (!ok) {
+        return false;
+    }
+    installRemoteSnapshot(State::Html, html, companionTextUtf8);
+    rememberClipboardUpdate();
+    Logger::write("clipboard: installed remote html, bytes=" +
+                  std::to_string(html.size()) + ", companionText=" +
+                  std::to_string(companionTextUtf8.size()));
+    return true;
+}
+
+bool ClipboardMonitor::setRtfToClipboard(const std::vector<uint8_t>& rtf,
+                                         const std::string& companionTextUtf8) {
+    if (rtf.empty() || m_rtfFormat == 0 ||
+        !openClipboardWithRetry(m_window, "write clipboard rtf")) {
+        return false;
+    }
+
+    bool ok = false;
+    if (EmptyClipboard()) {
+        const HGLOBAL handle = allocRawBlob(rtf.data(), rtf.size());
+        if (handle != nullptr) {
+            if (SetClipboardData(m_rtfFormat, handle) != nullptr) {
+                ok = true;
+                if (!companionTextUtf8.empty()) {
+                    const HGLOBAL textHandle =
+                        allocWideTextBlob(utf8ToWide(companionTextUtf8));
+                    if (textHandle != nullptr &&
+                        SetClipboardData(CF_UNICODETEXT, textHandle) == nullptr) {
+                        GlobalFree(textHandle);
+                    }
+                }
+            } else {
+                GlobalFree(handle);
+            }
+        }
+    }
+    CloseClipboard();
+    if (!ok) {
+        return false;
+    }
+    installRemoteSnapshot(State::Rtf, rtf, companionTextUtf8);
+    rememberClipboardUpdate();
+    Logger::write("clipboard: installed remote rtf, bytes=" +
+                  std::to_string(rtf.size()) + ", companionText=" +
+                  std::to_string(companionTextUtf8.size()));
+    return true;
 }
 
 bool ClipboardMonitor::setPendingFilesMeta(

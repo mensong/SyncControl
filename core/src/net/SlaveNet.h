@@ -10,6 +10,7 @@
 
 #include <atomic>
 #include <functional>
+#include <map>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -60,6 +61,14 @@ public:
                            const std::vector<FileEntry>& files)> handler) {
         m_remoteFilesMeta = std::move(handler);
     }
+    void setRemoteImageMetaHandler(
+        std::function<void(const ClipboardImageMeta& meta)> handler) {
+        m_remoteImageMeta = std::move(handler);
+    }
+    void setRemoteRichMetaHandler(
+        std::function<void(const ClipboardRichMeta& meta)> handler) {
+        m_remoteRichMeta = std::move(handler);
+    }
 
     std::vector<Peer>& peers() { return m_peers; }
     const std::vector<Peer>& peers() const { return m_peers; }
@@ -69,6 +78,10 @@ public:
     bool isInputActive() const { return m_inputActive; }
     // Target-side paste: asks Master for file data, waits for TCP completion.
     std::vector<FileEntry> requestClipboardFiles(const std::atomic<bool>& cancel);
+    std::vector<FileEntry> requestClipboardImage(const std::string& transferId,
+                                                 const std::atomic<bool>& cancel);
+    std::vector<FileEntry> requestClipboardRich(const std::string& transferId,
+                                                const std::atomic<bool>& cancel);
 
 private:
     Peer* findPeer(const sockaddr_in& endpoint);
@@ -79,10 +92,16 @@ private:
     void handleFrame(Peer& peer, const Message& message, uint64_t nowMs);
     void handleInputMessage(const Message& message);
     void handleMouseMove(Peer* peer, const Message& message);
+    void handleClipboardImageMeta(const ClipboardImageMeta& meta);
+    void handleClipboardRichMeta(const ClipboardRichMeta& meta);
     bool sendKcpFrame(Peer& peer, const Message& message);
     void sendFilesMeta(Peer& peer, const std::vector<FileEntry>& files,
                        const std::string& originPeerId,
                        uint32_t originClipboardSequence);
+    void sendClipboardImageMeta(Peer& peer, const ClipboardMonitor::Snapshot& snapshot);
+    void serveClipboardImageRequest(Peer& peer, const std::string& transferId);
+    void sendClipboardRichMeta(Peer& peer, const ClipboardMonitor::Snapshot& snapshot);
+    void serveClipboardRichRequest(Peer& peer, const std::string& transferId);
     void sendHandshakeResponse(Peer& peer);
     void sendHeartbeat(Peer& peer);
     void sendSlaveHello();
@@ -95,6 +114,8 @@ private:
     std::function<void(const std::string& originPeerId,
                        uint32_t originClipboardSequence,
                        const std::vector<FileEntry>& files)> m_remoteFilesMeta;
+    std::function<void(const ClipboardImageMeta& meta)> m_remoteImageMeta;
+    std::function<void(const ClipboardRichMeta& meta)> m_remoteRichMeta;
     FileTransferManager* m_fileTransfer = nullptr;
     std::atomic<bool> m_inputActive = false;
     bool m_running = false;
@@ -105,6 +126,22 @@ private:
     uint64_t m_lastHelloMs = 0;
     bool m_kcpOverride = false;
     KcpParameters m_kcpOverrideParameters;
+
+    struct CachedImage {
+        std::string path;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t bytes = 0;
+    };
+    std::map<std::string, CachedImage> m_clipboardImages;
+    struct CachedRich {
+        ClipboardRichKind kind = ClipboardRichKind::Html;
+        std::string richPath;
+        std::string textPath;
+        uint64_t richBytes = 0;
+        uint64_t textBytes = 0;
+    };
+    std::map<std::string, CachedRich> m_clipboardRich;
 };
 
 }  // namespace synccontrol

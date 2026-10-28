@@ -137,4 +137,31 @@ std::string endpointAddressToString(const sockaddr_in& endpoint) {
     return address;
 }
 
+bool resolveHostIpv4(const std::string& host, in_addr& address) {
+    if (InetPtonA(AF_INET, host.c_str(), &address) == 1) {
+        return true;
+    }
+
+    addrinfo hints{};
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_DGRAM;
+    addrinfo* results = nullptr;
+    if (getaddrinfo(host.c_str(), nullptr, &hints, &results) != 0 ||
+        results == nullptr) {
+        return false;
+    }
+
+    bool resolved = false;
+    for (const addrinfo* entry = results; entry != nullptr; entry = entry->ai_next) {
+        if (entry->ai_family == AF_INET &&
+            entry->ai_addrlen >= sizeof(sockaddr_in)) {
+            address = reinterpret_cast<const sockaddr_in*>(entry->ai_addr)->sin_addr;
+            resolved = true;
+            break;
+        }
+    }
+    freeaddrinfo(results);
+    return resolved;
+}
+
 }  // namespace synccontrol

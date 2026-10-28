@@ -31,11 +31,8 @@ uint16_t readU16(const uint8_t* data) {
            static_cast<uint16_t>(static_cast<uint16_t>(data[1]) << 8);
 }
 
-bool sameIpv4Subnet(const std::string& peerIp) {
-    in_addr peerAddress{};
-    if (InetPtonA(AF_INET, peerIp.c_str(), &peerAddress) != 1) {
-        return false;
-    }
+bool sameIpv4Subnet(const sockaddr_in& peerEndpoint) {
+    const in_addr peerAddress = peerEndpoint.sin_addr;
 
     char hostName[256]{};
     if (gethostname(hostName, sizeof(hostName)) != 0) {
@@ -79,11 +76,14 @@ bool MasterNet::start(const std::string& bindIp, const std::vector<PeerInit>& in
         sockaddr_in endpoint{};
         endpoint.sin_family = AF_INET;
         endpoint.sin_port = htons(init.port != 0 ? init.port : 19881);
-        if (InetPtonA(AF_INET, init.ip.c_str(), &endpoint.sin_addr) != 1) {
+        in_addr resolvedAddress{};
+        if (!resolveHostIpv4(init.ip, resolvedAddress)) {
+            Logger::write("master: cannot resolve peer address " + init.ip);
             m_socket.close();
             m_peers.clear();
             return false;
         }
+        endpoint.sin_addr = resolvedAddress;
 
         Peer peer{};
         peer.endpoint = endpoint;
@@ -338,6 +338,68 @@ bool MasterNet::sendClipboardTextTo(const std::string& peerId, const std::string
     return sendFrame(*peer, {MessageType::ClipboardText, encodeClipboardText(utf8)});
 }
 
+bool MasterNet::sendClipboardImageMetaTo(const std::string& peerId,
+                                         const ClipboardImageMeta& meta) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
+    Peer* peer = findPeerById(peerId);
+    if (peer == nullptr || !peer->connected || meta.transferId.empty()) {
+        return false;
+    }
+    const std::vector<uint8_t> payload = encodeClipboardImageMeta(meta);
+    if (payload.empty() || payload.size() > 0xFFFF) {
+        Logger::write("master: invalid clipboard image meta peer=" + peerId +
+                      ", bytes=" + std::to_string(payload.size()));
+        return false;
+    }
+    const bool sent = sendFrame(*peer,
+                                {MessageType::ClipboardImageMeta,
+                                 std::move(payload)});
+    if (sent) {
+        peer->kcp->flush();
+        Logger::write("master: sent clipboard image meta peer=" + peerId +
+                      ", transferId=" + meta.transferId +
+                      ", bytes=" + std::to_string(meta.totalBytes));
+    }
+    return sent;
+}
+
+bool MasterNet::sendClipboardRichMetaTo(const std::string& peerId,
+                                        const ClipboardRichMeta& meta) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
+    Peer* peer = findPeerById(peerId);
+    if (peer == nullptr || !peer->connected || meta.transferId.empty()) {
+        return false;
+    }
+
+    const bool sent = sendFrame(*peer,
+                                {MessageType::ClipboardRichMeta,
+                                 encodeClipboardRichMeta(meta)});
+    if (sent) {
+        peer->kcp->flush();
+        Logger::write("master: sent clipboard rich meta peer=" + peerId +
+                      ", transferId=" + meta.transferId +
+                      ", bytes=" + std::to_string(meta.richBytes));
+    }
+    return sent;
+}
+
+bool MasterNet::sendClipboardRichRequestTo(const std::string& peerId,
+                                           const std::string& transferId) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
+    Peer* peer = findPeerById(peerId);
+    if (peer == nullptr || !peer->connected || transferId.empty()) {
+        return false;
+    }
+
+    const bool sent = sendFrame(*peer,
+                                {MessageType::ClipboardRichRequest,
+                                 encodeClipboardRichRequest(transferId)});
+    if (sent) {
+        peer->kcp->flush();
+    }
+    return sent;
+}
+
 bool MasterNet::sendClipboardRequestTo(const std::string& peerId, bool files) {
     std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
     Peer* peer = findPeerById(peerId);
@@ -347,6 +409,22 @@ bool MasterNet::sendClipboardRequestTo(const std::string& peerId, bool files) {
     const bool sent = sendFrame(*peer,
                                 {MessageType::ClipboardRequest,
                                  encodeClipboardRequest(files)});
+    if (sent && peer->kcp) {
+        peer->kcp->flush();
+    }
+    return sent;
+}
+
+bool MasterNet::sendClipboardImageRequestTo(const std::string& peerId,
+                                            const std::string& transferId) {
+    std::lock_guard<std::recursive_mutex> lock(m_networkMutex);
+    Peer* peer = findPeerById(peerId);
+    if (peer == nullptr || !peer->connected || transferId.empty()) {
+        return false;
+    }
+    const bool sent = sendFrame(*peer,
+                                {MessageType::ClipboardImageRequest,
+                                 encodeClipboardImageRequest(transferId)});
     if (sent && peer->kcp) {
         peer->kcp->flush();
     }
@@ -390,7 +468,20 @@ void MasterNet::resetPeer(Peer& peer, uint64_t nowMs) {
     if (peer.firstAttemptMs == 0) {
         peer.firstAttemptMs = nowMs;
     }
-    peer.networkType = sameIpv4Subnet(peer.ip) ? "lan" : "cross";
+    in_addr resolvedAddress{};
+    if (resolveHostIpv4(peer.ip, resolvedAddress)) {
+        if (resolvedAddress.s_addr != peer.endpoint.sin_addr.s_addr) {
+            sockaddr_in resolvedEndpoint = peer.endpoint;
+            resolvedEndpoint.sin_addr = resolvedAddress;
+            Logger::write("master: peer " + peer.id + " resolved to " +
+                          endpointAddressToString(resolvedEndpoint));
+        }
+        peer.endpoint.sin_addr = resolvedAddress;
+    } else {
+        Logger::write("master: cannot resolve peer address " + peer.ip +
+                      "; using last known address");
+    }
+    peer.networkType = sameIpv4Subnet(peer.endpoint) ? "lan" : "cross";
     peer.kcpParameters = m_kcpOverride
         ? m_kcpOverrideParameters
         : (peer.networkType == "lan" ? kLanKcpParameters
@@ -653,6 +744,36 @@ void MasterNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) 
             }
             break;
         }
+        case MessageType::ClipboardImageMeta: {
+            ClipboardImageMeta meta;
+            if (decodeClipboardImageMeta(message.payload, meta) &&
+                onClipboardImageMeta) {
+                Logger::write("master: received clipboard image meta peer=" +
+                              peer.id + ", transferId=" + meta.transferId +
+                              ", bytes=" + std::to_string(meta.totalBytes));
+                onClipboardImageMeta(peer.id, meta);
+            } else {
+                Logger::write("master: received invalid clipboard image meta peer=" +
+                              peer.id + ", bytes=" +
+                              std::to_string(message.payload.size()));
+            }
+            break;
+        }
+        case MessageType::ClipboardRichMeta: {
+            ClipboardRichMeta meta;
+            if (decodeClipboardRichMeta(message.payload, meta) &&
+                onClipboardRichMeta) {
+                Logger::write("master: received clipboard rich meta peer=" +
+                              peer.id + ", transferId=" + meta.transferId +
+                              ", bytes=" + std::to_string(meta.richBytes));
+                onClipboardRichMeta(peer.id, meta);
+            } else {
+                Logger::write("master: received invalid clipboard rich meta peer=" +
+                              peer.id + ", bytes=" +
+                              std::to_string(message.payload.size()));
+            }
+            break;
+        }
         case MessageType::ClipboardFilesMeta: {
             std::vector<FileEntry> files;
             std::string originPeerId;
@@ -678,6 +799,26 @@ void MasterNet::handleFrame(Peer& peer, const Message& message, uint64_t nowMs) 
                 onClipboardFilesRequest) {
                 Logger::write("master: received clipboard files request peer=" + peer.id);
                 onClipboardFilesRequest(peer.id, peer.ip);
+            }
+            break;
+        }
+        case MessageType::ClipboardImageRequest: {
+            std::string transferId;
+            if (decodeClipboardImageRequest(message.payload, transferId) &&
+                onClipboardImageRequest) {
+                Logger::write("master: received clipboard image request peer=" +
+                              peer.id + ", transferId=" + transferId);
+                onClipboardImageRequest(peer.id, peer.ip, transferId);
+            }
+            break;
+        }
+        case MessageType::ClipboardRichRequest: {
+            std::string transferId;
+            if (decodeClipboardRichRequest(message.payload, transferId) &&
+                onClipboardRichRequest) {
+                Logger::write("master: received clipboard rich request peer=" +
+                              peer.id + ", transferId=" + transferId);
+                onClipboardRichRequest(peer.id, peer.ip, transferId);
             }
             break;
         }

@@ -459,6 +459,10 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             foreach (var node in screens)
             {
                 node.IsMaster = node.Id.Equals("master", StringComparison.OrdinalIgnoreCase);
+                if (node.IsMaster)
+                {
+                    node.ConnectionStatus = ConnectionStatus.Connected;
+                }
                 AttachScreen(node);
                 Screens.Add(node);
             }
@@ -623,6 +627,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         {
             "text" => "剪贴板：文本",
             "files" => "剪贴板：文件",
+            "image" => "剪贴板：图片",
+            "html" => "剪贴板：HTML",
+            "rtf" => "剪贴板：RTF",
             _ => "剪贴板：空",
         };
         UpdateTransferProgress(status["transfer"] as JsonObject);

@@ -68,6 +68,9 @@ public:
     FileTransferManager(const FileTransferManager&) = delete;
     FileTransferManager& operator=(const FileTransferManager&) = delete;
 
+    // Removes stale receive-session directories left by previous runs.
+    static void cleanupTempSessions();
+
     bool start(const std::string& bindIp, uint16_t listenPort);
     void stop();
 

@@ -40,18 +40,15 @@ private:
     struct OutputContext {
         UdpSocket* socket;
         sockaddr_in endpoint;
-        std::vector<uint8_t>* batch;
     };
 
     static int onKcpOutput(const char* data, int size, ikcpcb* kcp, void* user);
-    void flushOutput();
 
     ikcpcb* m_kcp = nullptr;
     IUINT32 m_conversationId = 0;
     KcpParameters m_parameters;
     UdpSocket* m_socket = nullptr;
     OutputContext m_outputContext{};
-    std::vector<uint8_t> m_outputBatch;
 };
 
 }  // namespace synccontrol

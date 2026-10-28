@@ -66,6 +66,7 @@ public partial class LayoutCanvas : UserControl
         if (DataContext is MainViewModel viewModel)
         {
             viewModel.SnapToEdges(_draggedNode);
+            viewModel.SaveLayoutCommand.Execute(null);
         }
         EndDrag(sender);
         e.Handled = true;

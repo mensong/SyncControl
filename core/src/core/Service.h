@@ -4,6 +4,7 @@
 #include <memory>
 #include <mutex>
 #include <json.hpp>
+#include <map>
 #include <queue>
 #include <string>
 #include <thread>
@@ -46,6 +47,16 @@ private:
     bool updateLayout(const nlohmann::json& layout);
     void handleClipboardSync(const std::string& fromPeerId, const std::string& toPeerId);
     void handleClipboardText(const std::string& fromPeerId, const std::string& utf8);
+    void handleClipboardImageMeta(const std::string& fromPeerId,
+                                  const ClipboardImageMeta& meta);
+    void handleClipboardImageRequest(const std::string& fromPeerId,
+                                     const std::string& fromPeerIp,
+                                     const std::string& transferId);
+    void handleClipboardRichMeta(const std::string& fromPeerId,
+                                 const ClipboardRichMeta& meta);
+    void handleClipboardRichRequest(const std::string& fromPeerId,
+                                    const std::string& fromPeerIp,
+                                    const std::string& transferId);
     void handleClipboardFiles(const std::string& fromPeerId,
                               const std::string& originPeerId,
                               uint32_t originClipboardSequence,
@@ -56,18 +67,30 @@ private:
                                 const std::string& originPeerId,
                                 uint32_t originClipboardSequence,
                                 const std::vector<FileEntry>& files);
+    void handleRemoteImageBatch(const std::string& sourceId,
+                                const std::string& sourceIp,
+                                const ClipboardImageMeta& meta);
+    void handleRemoteRichBatch(const std::string& sourceId,
+                               const std::string& sourceIp,
+                               const ClipboardRichMeta& meta);
     std::vector<FileEntry> executeRemoteFileTransfer(const TransferQueue::Task& task,
                                                      const std::atomic<bool>& cancel);
     void handleTransferQueueEvent(const TransferQueue::Task& task);
     ClipboardMonitor::RemotePasteResult gateRemotePaste(
         const std::vector<FileEntry>& metadata);
-    void deliverCompletedFiles(uint64_t taskId);
+    void deliverCompletedTransfer(uint64_t taskId);
     void ignorePendingTransfer(uint64_t taskId);
     void handleTransferProgress(const FileTransferManager::Status& status);
     bool isLocalPeerId(const std::string& peerId);
     void reauthenticatePeers();
     std::vector<FileEntry> requestRemoteFilesFromPeer(const std::string& peerId,
                                                       const std::atomic<bool>& cancel);
+    std::vector<FileEntry> requestRemoteImageFromPeer(
+        const std::string& peerId, const std::string& transferId,
+        const std::atomic<bool>& cancel);
+    std::vector<FileEntry> requestRemoteRichFromPeer(
+        const std::string& peerId, const std::string& transferId,
+        const std::atomic<bool>& cancel);
     bool resolveMasterScreen(const ScreenLayout& layout, std::string& masterId) const;
     InputCapture::RouteTarget lookupRouteForCapture(const std::string& screenId,
                                                     Edge edge, float ratio);
@@ -99,8 +122,27 @@ private:
     std::string m_role = "idle";
     std::string m_pendingClipboardTarget;
     std::string m_lastSentClipboardText;
+    std::string m_lastSentClipboardImageKey;
+    std::string m_lastSentClipboardRichKey;
     std::string m_lastSentClipboardFilesKey;
     std::string m_filesClipboardSource;
+    std::string m_imageClipboardSource;
+    std::string m_richClipboardSource;
+    struct CachedImage {
+        std::string path;
+        uint32_t width = 0;
+        uint32_t height = 0;
+        uint32_t bytes = 0;
+    };
+    std::map<std::string, CachedImage> m_clipboardImages;
+    struct CachedRich {
+        ClipboardRichKind kind = ClipboardRichKind::Html;
+        std::string richPath;
+        std::string textPath;
+        uint64_t richBytes = 0;
+        uint64_t textBytes = 0;
+    };
+    std::map<std::string, CachedRich> m_clipboardRich;
     std::thread::id m_serviceThreadId;
     bool m_running = false;
 };

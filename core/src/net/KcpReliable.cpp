@@ -1,5 +1,6 @@
 #include "net/KcpReliable.h"
 
+#include "core/Logger.h"
 #include "net/Protocol.h"
 
 // Keep only the wire constants; the network profile is supplied by the owner.
@@ -19,7 +20,6 @@ KcpReliable::KcpReliable(UdpSocket& socket, const sockaddr_in& endpoint, IUINT32
     : m_conversationId(conversationId), m_socket(&socket) {
     m_outputContext.socket = &socket;
     m_outputContext.endpoint = endpoint;
-    m_outputContext.batch = &m_outputBatch;
     m_kcp = ikcp_create(conversationId, &m_outputContext);
     m_kcp->output = &KcpReliable::onKcpOutput;
     setParameters(kLanKcpParameters);
@@ -58,7 +58,6 @@ IUINT32 KcpReliable::rcvNext() const {
 void KcpReliable::update(IUINT32 currentMs) {
     if (m_kcp != nullptr) {
         ikcp_update(m_kcp, currentMs);
-        flushOutput();
     }
 }
 
@@ -80,7 +79,6 @@ void KcpReliable::resetSession() {
     if (m_kcp != nullptr) {
         ikcp_release(m_kcp);
     }
-    m_outputBatch.clear();
     m_kcp = ikcp_create(m_conversationId, &m_outputContext);
     m_kcp->output = &KcpReliable::onKcpOutput;
     setParameters(m_parameters);
@@ -93,21 +91,19 @@ int KcpReliable::onKcpOutput(const char* data, int size, ikcpcb* /*kcp*/, void* 
     }
 
     OutputContext* context = static_cast<OutputContext*>(user);
-    std::vector<uint8_t>& batch = *context->batch;
-    batch.reserve(batch.size() + static_cast<size_t>(size) + 2);
-    appendU16(batch, kKcpPacketMagic);
-    batch.insert(batch.end(), data, data + size);
-    return 0;
-}
-
-void KcpReliable::flushOutput() {
-    if (m_outputBatch.empty()) {
-        return;
+    std::vector<uint8_t> packet;
+    packet.reserve(static_cast<size_t>(size) + 2);
+    appendU16(packet, kKcpPacketMagic);
+    packet.insert(packet.end(), data, data + size);
+    if (!context->socket->sendTo(context->endpoint, packet.data(),
+                                 packet.size())) {
+        Logger::write("kcp: UDP send failed, bytes=" +
+                      std::to_string(packet.size()) +
+                      ", win32Error=" +
+                      std::to_string(static_cast<uint32_t>(WSAGetLastError())));
+        return -1;
     }
-    const bool sent = m_socket->sendTo(m_outputContext.endpoint, m_outputBatch.data(),
-                                       m_outputBatch.size());
-    m_outputBatch.clear();
-    (void)sent;
+    return 0;
 }
 
 }  // namespace synccontrol

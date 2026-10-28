@@ -258,6 +258,61 @@ void cleanupCreated(const std::vector<std::wstring>& files,
 
 }  // namespace
 
+bool deleteDirectoryRecursive(const std::wstring& dir) {
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = FindFirstFileW((dir + L"\\*").c_str(), &find);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return RemoveDirectoryW(dir.c_str()) != 0;
+    }
+    bool ok = true;
+    do {
+        if (wcscmp(find.cFileName, L".") == 0 ||
+            wcscmp(find.cFileName, L"..") == 0) {
+            continue;
+        }
+        const std::wstring path = dir + L"\\" + find.cFileName;
+        if (find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ok = deleteDirectoryRecursive(path) && ok;
+        } else {
+            ok = (DeleteFileW(path.c_str()) != 0) && ok;
+        }
+    } while (FindNextFileW(handle, &find));
+    FindClose(handle);
+    return RemoveDirectoryW(dir.c_str()) != 0 && ok;
+}
+
+void FileTransferManager::cleanupTempSessions() {
+    const std::wstring root = clipboardTempRoot();
+    if (root.empty()) {
+        return;
+    }
+    WIN32_FIND_DATAW find{};
+    HANDLE handle = FindFirstFileW((root + L"\\t*").c_str(), &find);
+    if (handle == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    size_t removed = 0;
+    do {
+        if ((find.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0 ||
+            wcscmp(find.cFileName, L".") == 0 ||
+            wcscmp(find.cFileName, L"..") == 0) {
+            continue;
+        }
+        const std::wstring session = root + L"\\" + find.cFileName;
+        if (deleteDirectoryRecursive(session)) {
+            ++removed;
+        } else {
+            Logger::write("file transfer: failed to clean stale clipboard session " +
+                          wideToUtf8(session));
+        }
+    } while (FindNextFileW(handle, &find));
+    FindClose(handle);
+    if (removed != 0) {
+        Logger::write("file transfer: cleaned " + std::to_string(removed) +
+                      " stale clipboard session directories at startup");
+    }
+}
+
 bool sendFilesOverTcp(const std::vector<FileEntry>& files, const std::string& ip,
                       uint16_t port, const std::atomic<bool>& cancel,
                       const TransferProgressFn& progress) {

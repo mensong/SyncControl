@@ -23,10 +23,12 @@ bool TcpFileChannel::connect(const std::string& ip, uint16_t port) {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(port);
-    if (inet_pton(AF_INET, ip.c_str(), &address.sin_addr) != 1) {
+    in_addr resolvedAddress{};
+    if (!resolveHostIpv4(ip, resolvedAddress)) {
         close();
         return false;
     }
+    address.sin_addr = resolvedAddress;
     if (::connect(m_socket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR) {
         close();
         return false;

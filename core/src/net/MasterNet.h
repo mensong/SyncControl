@@ -82,7 +82,15 @@ public:
     bool sendSwitchOut();
     bool sendSwitchOutFrom(const std::string& peerId);
     bool sendClipboardTextTo(const std::string& peerId, const std::string& utf8);
+    bool sendClipboardImageMetaTo(const std::string& peerId,
+                                  const ClipboardImageMeta& meta);
+    bool sendClipboardRichMetaTo(const std::string& peerId,
+                                 const ClipboardRichMeta& meta);
     bool sendClipboardRequestTo(const std::string& peerId, bool files = false);
+    bool sendClipboardImageRequestTo(const std::string& peerId,
+                                     const std::string& transferId);
+    bool sendClipboardRichRequestTo(const std::string& peerId,
+                                    const std::string& transferId);
     bool sendFilesMetaTo(const std::string& peerId,
                          const std::vector<FileEntry>& files,
                          const std::string& originPeerId,
@@ -93,12 +101,20 @@ public:
     // Fires on the Service poll thread when a peer answers CLIPBOARD_REQUEST.
     std::function<void(const std::string& fromPeerId, const std::string& utf8)> onClipboardText;
     std::function<void(const std::string& fromPeerId,
+                       const ClipboardImageMeta& meta)> onClipboardImageMeta;
+    std::function<void(const std::string& fromPeerId,
+                       const ClipboardRichMeta& meta)> onClipboardRichMeta;
+    std::function<void(const std::string& fromPeerId,
                        const std::string& originPeerId,
                        uint32_t originClipboardSequence,
                        const std::vector<FileEntry>& files)> onClipboardFiles;
     // files=true paste request from a peer. The callback supplies the target IP.
     std::function<void(const std::string& fromPeerId, const std::string& fromPeerIp)>
         onClipboardFilesRequest;
+    std::function<void(const std::string& fromPeerId, const std::string& fromPeerIp,
+                       const std::string& transferId)> onClipboardImageRequest;
+    std::function<void(const std::string& fromPeerId, const std::string& fromPeerIp,
+                       const std::string& transferId)> onClipboardRichRequest;
 
     std::vector<Peer>& peers() { return m_peers; }
     const std::vector<Peer>& peers() const { return m_peers; }

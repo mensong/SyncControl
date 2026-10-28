@@ -143,8 +143,6 @@
                         <TextBlock Text="端口" VerticalAlignment="Center" Margin="16,0,8,0" />
                         <TextBox Text="{Binding Port, UpdateSourceTrigger=PropertyChanged}"
                                  Width="80" Padding="6,4" />
-                        <Button Content="保存布局" MinWidth="92" Padding="10,6"
-                                Command="{Binding SaveLayoutCommand}" Margin="16,0,0,0" />
                     </StackPanel>
                     <local:LayoutCanvas />
                 </DockPanel>

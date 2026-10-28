@@ -202,9 +202,143 @@ ServiceSettings loadServiceSettings() {
     return settings;
 }
 
+std::string nextClipboardImageTransferId() {
+    static uint64_t counter = 0;
+    return "img-" + std::to_string(GetTickCount64()) + "-" +
+           std::to_string(++counter);
+}
+
+bool saveClipboardImageFile(const std::string& transferId,
+                            const std::vector<uint8_t>& png,
+                            std::string& path) {
+    char root[MAX_PATH]{};
+    const UINT length = GetEnvironmentVariableA("LOCALAPPDATA", root, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return false;
+    }
+    const std::string base = std::string(root, length) + "\\SyncControl";
+    if (!CreateDirectoryA(base.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    if (!CreateDirectoryA((base + "\\clipboard").c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    const std::string images = base + "\\clipboard\\images";
+    if (!CreateDirectoryA(images.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    path = images + "\\" + transferId + ".png";
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    if (!file) {
+        return false;
+    }
+    file.write(reinterpret_cast<const char*>(png.data()),
+               static_cast<std::streamsize>(png.size()));
+    return static_cast<bool>(file);
+}
+
+std::vector<uint8_t> readFileBytes(const std::string& path,
+                                   uint64_t maxBytes) {
+    if (path.empty()) {
+        return {};
+    }
+    std::ifstream file(path, std::ios::binary | std::ios::ate);
+    if (!file) {
+        return {};
+    }
+    const std::streamoff end = file.tellg();
+    if (end < 0 || static_cast<uint64_t>(end) > maxBytes) {
+        return {};
+    }
+    std::vector<uint8_t> bytes(static_cast<size_t>(end));
+    file.seekg(0, std::ios::beg);
+    if (!bytes.empty()) {
+        file.read(reinterpret_cast<char*>(bytes.data()),
+                  static_cast<std::streamsize>(bytes.size()));
+    }
+    return file ? bytes : std::vector<uint8_t>{};
+}
+
+bool isImageTransferFile(const FileEntry& entry) {
+    return !entry.isDir && entry.name.size() > 8 &&
+           entry.name.compare(0, 4, "img-") == 0 &&
+           entry.name.compare(entry.name.size() - 4, 4, ".png") == 0;
+}
+
+std::string nextClipboardRichTransferId() {
+    static uint64_t counter = 0;
+    return "rich-" + std::to_string(GetTickCount64()) + "-" +
+           std::to_string(++counter);
+}
+
+std::string richExtension(ClipboardRichKind kind) {
+    return kind == ClipboardRichKind::Rtf ? ".rtf" : ".html";
+}
+
+bool isRichTransferFile(const FileEntry& entry) {
+    if (entry.isDir || entry.name.size() < 14 ||
+        entry.name.compare(0, 5, "rich-") != 0) {
+        return false;
+    }
+    return entry.name.compare(entry.name.size() - 5, 5, ".html") == 0 ||
+           entry.name.compare(entry.name.size() - 4, 4, ".rtf") == 0;
+}
+
+bool saveClipboardRichFile(const std::string& transferId,
+                           ClipboardRichKind kind,
+                           const std::vector<uint8_t>& richData,
+                           const std::string& companionTextUtf8,
+                           std::string& richPath,
+                           std::string& textPath) {
+    char root[MAX_PATH]{};
+    const UINT length = GetEnvironmentVariableA("LOCALAPPDATA", root, MAX_PATH);
+    if (length == 0 || length >= MAX_PATH) {
+        return false;
+    }
+    const std::string base = std::string(root, length) + "\\SyncControl";
+    if (!CreateDirectoryA(base.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    if (!CreateDirectoryA((base + "\\clipboard").c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    const std::string rich = base + "\\clipboard\\rich";
+    if (!CreateDirectoryA(rich.c_str(), nullptr) &&
+        GetLastError() != ERROR_ALREADY_EXISTS) {
+        return false;
+    }
+    richPath = rich + "\\" + transferId + richExtension(kind);
+    textPath = rich + "\\" + transferId + ".txt";
+    std::ofstream richFile(richPath, std::ios::binary | std::ios::trunc);
+    if (!richFile) {
+        return false;
+    }
+    richFile.write(reinterpret_cast<const char*>(richData.data()),
+                   static_cast<std::streamsize>(richData.size()));
+    richFile.close();
+    if (!richFile) {
+        return false;
+    }
+    const std::vector<uint8_t> textData(companionTextUtf8.begin(),
+                                        companionTextUtf8.end());
+    std::ofstream textFile(textPath, std::ios::binary | std::ios::trunc);
+    if (!textFile) {
+        return false;
+    }
+    textFile.write(reinterpret_cast<const char*>(textData.data()),
+                   static_cast<std::streamsize>(textData.size()));
+    return static_cast<bool>(textFile);
+}
+
 }  // namespace
 
 Service::Service() {
+    FileTransferManager::cleanupTempSessions();
     m_ipc = std::make_unique<IpcServer>([this](const nlohmann::json& command) {
         return handleIpc(command);
     });
@@ -410,6 +544,14 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
                                        const std::string& utf8) {
         handleClipboardText(fromPeerId, utf8);
     };
+    m_master->onClipboardImageMeta = [this](const std::string& fromPeerId,
+                                            const ClipboardImageMeta& meta) {
+        handleClipboardImageMeta(fromPeerId, meta);
+    };
+    m_master->onClipboardRichMeta = [this](const std::string& fromPeerId,
+                                           const ClipboardRichMeta& meta) {
+        handleClipboardRichMeta(fromPeerId, meta);
+    };
     m_master->onClipboardFiles = [this](const std::string& fromPeerId,
                                         const std::string& originPeerId,
                                         uint32_t originClipboardSequence,
@@ -419,6 +561,16 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
     m_master->onClipboardFilesRequest = [this](const std::string& fromPeerId,
                                                const std::string& fromPeerIp) {
         handleClipboardFilesRequest(fromPeerId, fromPeerIp);
+    };
+    m_master->onClipboardImageRequest = [this](const std::string& fromPeerId,
+                                               const std::string& fromPeerIp,
+                                               const std::string& transferId) {
+        handleClipboardImageRequest(fromPeerId, fromPeerIp, transferId);
+    };
+    m_master->onClipboardRichRequest = [this](const std::string& fromPeerId,
+                                              const std::string& fromPeerIp,
+                                              const std::string& transferId) {
+        handleClipboardRichRequest(fromPeerId, fromPeerIp, transferId);
     };
     if (!m_inputCapture->start(callbacks)) {
         m_master->stop();
@@ -466,6 +618,20 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
         }
         handleRemoteFilesBatch("master", sourceIp, originPeerId,
                                originClipboardSequence, files);
+    });
+    m_slave->setRemoteImageMetaHandler([this](const ClipboardImageMeta& meta) {
+        std::string sourceIp = "master";
+        if (m_slave && !m_slave->peers().empty()) {
+            sourceIp = endpointAddressToString(m_slave->peers().front().endpoint);
+        }
+        handleRemoteImageBatch("master", sourceIp, meta);
+    });
+    m_slave->setRemoteRichMetaHandler([this](const ClipboardRichMeta& meta) {
+        std::string sourceIp = "master";
+        if (m_slave && !m_slave->peers().empty()) {
+            sourceIp = endpointAddressToString(m_slave->peers().front().endpoint);
+        }
+        handleRemoteRichBatch("master", sourceIp, meta);
     });
     m_slave->setClipboardMonitor(m_clipboard.get());
     if (!m_fileTransfer) {
@@ -555,8 +721,14 @@ void Service::stopMode() {
     }
     m_pendingClipboardTarget.clear();
     m_lastSentClipboardText.clear();
+    m_lastSentClipboardImageKey.clear();
+    m_lastSentClipboardRichKey.clear();
     m_lastSentClipboardFilesKey.clear();
     m_filesClipboardSource.clear();
+    m_imageClipboardSource.clear();
+    m_richClipboardSource.clear();
+    m_clipboardImages.clear();
+    m_clipboardRich.clear();
     m_pendingConfirmTaskId = 0;
     m_pendingConfirmOrigin.clear();
     m_pendingConfirmSequence = 0;
@@ -594,12 +766,133 @@ void Service::handleClipboardSync(const std::string& fromPeerId,
             if (m_master->sendFilesMetaTo(toPeerId, snapshot.files,
                                           origin, sequence)) {
                 m_lastSentClipboardText.clear();
+                m_lastSentClipboardImageKey.clear();
+                m_lastSentClipboardRichKey.clear();
                 m_filesClipboardSource = origin;
             }
             return;
         }
+        if (toPeerId.empty()) {
+            return;
+        }
+        if (snapshot.state == ClipboardMonitor::State::Image &&
+            !snapshot.pngData.empty()) {
+            if (snapshot.pngData.size() > kMaxClipboardImageBytes) {
+                Logger::write(
+                    "clipboard: image rejected, bytes=" +
+                    std::to_string(snapshot.pngData.size()) +
+                    ", limit=" + std::to_string(kMaxClipboardImageBytes));
+                return;
+            }
+            const std::string imageKey =
+                std::to_string(snapshot.clipboardSequence) + "|" +
+                std::to_string(snapshot.pngData.size());
+            if (imageKey != m_lastSentClipboardImageKey) {
+                std::string localPeerId;
+                {
+                    std::lock_guard<std::mutex> layoutLock(m_layoutMutex);
+                    localPeerId = m_masterScreenId;
+                }
+                const std::string transferId = nextClipboardImageTransferId();
+                ClipboardImageMeta meta;
+                meta.transferId = transferId;
+                meta.originPeerId = snapshot.originPeerId.empty()
+                                        ? localPeerId
+                                        : snapshot.originPeerId;
+                meta.originClipboardSequence =
+                    snapshot.originPeerId.empty()
+                        ? snapshot.clipboardSequence
+                        : snapshot.originClipboardSequence;
+                meta.width = snapshot.imageWidth;
+                meta.height = snapshot.imageHeight;
+                meta.totalBytes = static_cast<uint32_t>(snapshot.pngData.size());
+                if (saveClipboardImageFile(transferId, snapshot.pngData,
+                                           m_clipboardImages[transferId].path)) {
+                    m_clipboardImages[transferId].width = meta.width;
+                    m_clipboardImages[transferId].height = meta.height;
+                    m_clipboardImages[transferId].bytes = meta.totalBytes;
+                    if (m_master->sendClipboardImageMetaTo(toPeerId, meta)) {
+                        m_lastSentClipboardImageKey = imageKey;
+                        m_lastSentClipboardText.clear();
+                        m_lastSentClipboardRichKey.clear();
+                        m_filesClipboardSource.clear();
+                        m_imageClipboardSource.clear();
+                        m_richClipboardSource.clear();
+                    }
+                } else {
+                    m_clipboardImages.erase(transferId);
+                    Logger::write(
+                        "master: failed to save clipboard image cache, bytes=" +
+                        std::to_string(snapshot.pngData.size()));
+                }
+            }
+            return;
+        }
+        if ((snapshot.state == ClipboardMonitor::State::Html &&
+             !snapshot.htmlData.empty()) ||
+            (snapshot.state == ClipboardMonitor::State::Rtf &&
+             !snapshot.rtfData.empty())) {
+            const bool isRtf = snapshot.state == ClipboardMonitor::State::Rtf;
+            const std::vector<uint8_t>& richData =
+                isRtf ? snapshot.rtfData : snapshot.htmlData;
+            if (richData.size() > kMaxClipboardRichBytes) {
+                Logger::write(
+                    "clipboard: rich content rejected, bytes=" +
+                    std::to_string(richData.size()) +
+                    ", limit=" + std::to_string(kMaxClipboardRichBytes));
+                return;
+            }
+            const std::string richKey =
+                std::to_string(snapshot.clipboardSequence) + "|" +
+                (isRtf ? std::string("rtf") : std::string("html")) + "|" +
+                std::to_string(richData.size());
+            if (richKey != m_lastSentClipboardRichKey) {
+                std::string localPeerId;
+                {
+                    std::lock_guard<std::mutex> layoutLock(m_layoutMutex);
+                    localPeerId = m_masterScreenId;
+                }
+                const std::string transferId = nextClipboardRichTransferId();
+                ClipboardRichMeta meta;
+                meta.transferId = transferId;
+                meta.kind = isRtf ? ClipboardRichKind::Rtf
+                                  : ClipboardRichKind::Html;
+                meta.richBytes = richData.size();
+                meta.companionTextBytes = snapshot.text.size();
+                meta.originPeerId = snapshot.originPeerId.empty()
+                                        ? localPeerId
+                                        : snapshot.originPeerId;
+                meta.originClipboardSequence =
+                    snapshot.originPeerId.empty()
+                        ? snapshot.clipboardSequence
+                        : snapshot.originClipboardSequence;
+                CachedRich& cache = m_clipboardRich[transferId];
+                cache.kind = meta.kind;
+                cache.richBytes = meta.richBytes;
+                cache.textBytes = meta.companionTextBytes;
+                if (saveClipboardRichFile(transferId, meta.kind, richData,
+                                          snapshot.text, cache.richPath,
+                                          cache.textPath)) {
+                    if (m_master->sendClipboardRichMetaTo(toPeerId, meta)) {
+                        m_lastSentClipboardRichKey = richKey;
+                        m_lastSentClipboardText.clear();
+                        m_lastSentClipboardImageKey.clear();
+                        m_lastSentClipboardFilesKey.clear();
+                        m_filesClipboardSource.clear();
+                        m_imageClipboardSource.clear();
+                        m_richClipboardSource.clear();
+                    }
+                } else {
+                    m_clipboardRich.erase(transferId);
+                    Logger::write(
+                        "master: failed to save clipboard rich cache, bytes=" +
+                        std::to_string(richData.size()));
+                }
+            }
+            return;
+        }
         if (snapshot.state != ClipboardMonitor::State::Text ||
-            snapshot.text.empty() || toPeerId.empty()) {
+            snapshot.text.empty()) {
             return;
         }
         if (snapshot.text == m_lastSentClipboardText) {
@@ -607,6 +900,8 @@ void Service::handleClipboardSync(const std::string& fromPeerId,
         }
         if (m_master->sendClipboardTextTo(toPeerId, snapshot.text)) {
             m_lastSentClipboardText = snapshot.text;
+            m_lastSentClipboardImageKey.clear();
+            m_lastSentClipboardRichKey.clear();
             m_filesClipboardSource.clear();
         }
         return;
@@ -639,6 +934,60 @@ void Service::handleClipboardText(const std::string& fromPeerId, const std::stri
     }
 }
 
+void Service::handleClipboardImageMeta(const std::string& fromPeerId,
+                                       const ClipboardImageMeta& meta) {
+    if (meta.transferId.empty() || m_master == nullptr) {
+        return;
+    }
+
+    std::string origin = meta.originPeerId.empty() ? fromPeerId : meta.originPeerId;
+    if (isLocalPeerId(origin)) {
+        Logger::write("clipboard: ignored own clipboard image echo, origin=" +
+                      origin + ", transferId=" + meta.transferId);
+        return;
+    }
+
+    ClipboardImageMeta forwarded = meta;
+    forwarded.originPeerId = origin;
+    const std::string target = m_pendingClipboardTarget;
+    m_pendingClipboardTarget.clear();
+    m_filesClipboardSource.clear();
+    m_imageClipboardSource.clear();
+    m_imageClipboardSource = origin;
+    if (!target.empty()) {
+        m_master->sendClipboardImageMetaTo(target, forwarded);
+        return;
+    }
+    handleRemoteImageBatch(fromPeerId, fromPeerId, forwarded);
+}
+
+void Service::handleClipboardRichMeta(const std::string& fromPeerId,
+                                      const ClipboardRichMeta& meta) {
+    if (meta.transferId.empty() || m_master == nullptr) {
+        return;
+    }
+
+    std::string origin = meta.originPeerId.empty() ? fromPeerId : meta.originPeerId;
+    if (isLocalPeerId(origin)) {
+        Logger::write("clipboard: ignored own clipboard rich echo, origin=" +
+                      origin + ", transferId=" + meta.transferId);
+        return;
+    }
+
+    ClipboardRichMeta forwarded = meta;
+    forwarded.originPeerId = origin;
+    const std::string target = m_pendingClipboardTarget;
+    m_pendingClipboardTarget.clear();
+    m_filesClipboardSource.clear();
+    m_imageClipboardSource.clear();
+    m_richClipboardSource = origin;
+    if (!target.empty()) {
+        m_master->sendClipboardRichMetaTo(target, forwarded);
+        return;
+    }
+    handleRemoteRichBatch(fromPeerId, fromPeerId, forwarded);
+}
+
 void Service::handleClipboardFiles(const std::string& fromPeerId,
                                    const std::string& originPeerId,
                                    uint32_t originClipboardSequence,
@@ -649,6 +998,7 @@ void Service::handleClipboardFiles(const std::string& fromPeerId,
 
     const std::string target = m_pendingClipboardTarget;
     m_pendingClipboardTarget.clear();
+    m_imageClipboardSource.clear();
     if (!target.empty()) {
         if (m_master->sendFilesMetaTo(target, files, originPeerId,
                                       originClipboardSequence)) {
@@ -790,11 +1140,243 @@ void Service::handleRemoteFilesBatch(const std::string& sourceId,
     }
 }
 
+void Service::handleRemoteImageBatch(const std::string& sourceId,
+                                     const std::string& sourceIp,
+                                     const ClipboardImageMeta& meta) {
+    if (m_transferQueue == nullptr || m_clipboard == nullptr ||
+        meta.transferId.empty()) {
+        return;
+    }
+
+    if (m_serviceThreadId != std::this_thread::get_id()) {
+        m_clipboard->postClipboardAction([this, sourceId, sourceIp, meta]() {
+            handleRemoteImageBatch(sourceId, sourceIp, meta);
+        });
+        return;
+    }
+
+    if (isLocalPeerId(meta.originPeerId)) {
+        Logger::write("clipboard: ignored own clipboard image echo, origin=" +
+                      meta.originPeerId + ", transferId=" + meta.transferId);
+        return;
+    }
+    if (meta.originClipboardSequence != 0 &&
+        meta.originPeerId == m_lastIgnoredOrigin &&
+        meta.originClipboardSequence == m_lastIgnoredSequence) {
+        Logger::write(
+            "clipboard: ignored previously dismissed clipboard image, origin=" +
+            meta.originPeerId + ", sequence=" +
+            std::to_string(meta.originClipboardSequence));
+        return;
+    }
+
+    FileEntry entry;
+    entry.name = meta.transferId + ".png";
+    entry.size = meta.totalBytes;
+    const TransferQueue::OfferResult offer = m_transferQueue->offerBatch(
+        {entry}, sourceId, meta.originPeerId, meta.originClipboardSequence,
+        sourceIp, 0);
+    if (offer.restored) {
+        deliverCompletedTransfer(offer.taskId);
+        return;
+    }
+
+    Logger::write("clipboard: remote image offered, task=" +
+                  std::to_string(offer.taskId) + ", created=" +
+                  std::to_string(offer.created ? 1 : 0) +
+                  ", transferId=" + meta.transferId +
+                  ", bytes=" + std::to_string(meta.totalBytes));
+    if (offer.created) {
+        m_pendingConfirmTaskId = offer.taskId;
+        m_pendingConfirmOrigin = meta.originPeerId;
+        m_pendingConfirmSequence = meta.originClipboardSequence;
+        if (m_confirmWindow) {
+            m_confirmWindow->show(
+                meta.originPeerId.empty()
+                    ? (sourceId.empty() ? sourceIp : sourceId)
+                    : meta.originPeerId,
+                1, meta.totalBytes,
+                {"图片 " + std::to_string(meta.width) + "x" +
+                     std::to_string(meta.height)});
+        }
+    }
+}
+
+void Service::handleRemoteRichBatch(const std::string& sourceId,
+                                    const std::string& sourceIp,
+                                    const ClipboardRichMeta& meta) {
+    if (m_transferQueue == nullptr || m_clipboard == nullptr ||
+        meta.transferId.empty()) {
+        return;
+    }
+
+    if (m_serviceThreadId != std::this_thread::get_id()) {
+        m_clipboard->postClipboardAction([this, sourceId, sourceIp, meta]() {
+            handleRemoteRichBatch(sourceId, sourceIp, meta);
+        });
+        return;
+    }
+
+    if (isLocalPeerId(meta.originPeerId)) {
+        Logger::write("clipboard: ignored own clipboard rich echo, origin=" +
+                      meta.originPeerId + ", transferId=" + meta.transferId);
+        return;
+    }
+    if (meta.originClipboardSequence != 0 &&
+        meta.originPeerId == m_lastIgnoredOrigin &&
+        meta.originClipboardSequence == m_lastIgnoredSequence) {
+        Logger::write(
+            "clipboard: ignored previously dismissed clipboard rich content, origin=" +
+            meta.originPeerId + ", sequence=" +
+            std::to_string(meta.originClipboardSequence));
+        return;
+    }
+
+    FileEntry entry;
+    entry.name = meta.transferId + richExtension(meta.kind);
+    entry.size = meta.richBytes;
+    const TransferQueue::OfferResult offer = m_transferQueue->offerBatch(
+        {entry}, sourceId, meta.originPeerId, meta.originClipboardSequence,
+        sourceIp, 0);
+    if (offer.restored) {
+        deliverCompletedTransfer(offer.taskId);
+        return;
+    }
+
+    Logger::write("clipboard: remote rich content offered, task=" +
+                  std::to_string(offer.taskId) + ", created=" +
+                  std::to_string(offer.created ? 1 : 0) +
+                  ", transferId=" + meta.transferId +
+                  ", bytes=" + std::to_string(meta.richBytes));
+    if (offer.created) {
+        m_pendingConfirmTaskId = offer.taskId;
+        m_pendingConfirmOrigin = meta.originPeerId;
+        m_pendingConfirmSequence = meta.originClipboardSequence;
+        if (m_confirmWindow) {
+            m_confirmWindow->show(
+                meta.originPeerId.empty()
+                    ? (sourceId.empty() ? sourceIp : sourceId)
+                    : meta.originPeerId,
+                1, meta.richBytes,
+                {meta.kind == ClipboardRichKind::Rtf
+                     ? "富文本 RTF"
+                     : "富文本 HTML"});
+        }
+    }
+}
+
+void Service::handleClipboardImageRequest(const std::string& fromPeerId,
+                                          const std::string& fromPeerIp,
+                                          const std::string& transferId) {
+    (void)fromPeerId;
+    if (m_master == nullptr || m_fileTransfer == nullptr || transferId.empty()) {
+        return;
+    }
+
+    if (!m_imageClipboardSource.empty()) {
+        if (!m_master->sendClipboardImageRequestTo(m_imageClipboardSource,
+                                                   transferId)) {
+            Logger::write("master: cannot relay clipboard image request source=" +
+                          m_imageClipboardSource);
+            return;
+        }
+        Logger::write("master: relaying clipboard image from " +
+                      m_imageClipboardSource + " to " + fromPeerIp);
+        m_fileTransfer->relayAsync(fromPeerIp,
+                                   m_master->peerFilePortByIp(fromPeerIp));
+        m_imageClipboardSource.clear();
+        return;
+    }
+
+    auto image = m_clipboardImages.find(transferId);
+    if (image == m_clipboardImages.end()) {
+        Logger::write(
+            "master: unknown local clipboard image request, transferId=" +
+            transferId);
+        return;
+    }
+    FileEntry entry;
+    entry.path = image->second.path;
+    entry.name = transferId + ".png";
+    entry.size = image->second.bytes;
+    Logger::write("master: sending local clipboard image peer=" + fromPeerId +
+                  ", ip=" + fromPeerIp + ", transferId=" + transferId +
+                  ", bytes=" + std::to_string(entry.size));
+    m_fileTransfer->sendAsync({entry}, fromPeerIp,
+                              m_master->peerFilePortByIp(fromPeerIp));
+}
+
+void Service::handleClipboardRichRequest(const std::string& fromPeerId,
+                                         const std::string& fromPeerIp,
+                                         const std::string& transferId) {
+    (void)fromPeerId;
+    if (m_master == nullptr || m_fileTransfer == nullptr || transferId.empty()) {
+        return;
+    }
+
+    if (!m_richClipboardSource.empty()) {
+        if (!m_master->sendClipboardRichRequestTo(m_richClipboardSource,
+                                                  transferId)) {
+            Logger::write("master: cannot relay clipboard rich request source=" +
+                          m_richClipboardSource);
+            return;
+        }
+        Logger::write("master: relaying clipboard rich content from " +
+                      m_richClipboardSource + " to " + fromPeerIp);
+        m_fileTransfer->relayAsync(fromPeerIp,
+                                   m_master->peerFilePortByIp(fromPeerIp));
+        m_richClipboardSource.clear();
+        return;
+    }
+
+    auto rich = m_clipboardRich.find(transferId);
+    if (rich == m_clipboardRich.end()) {
+        Logger::write(
+            "master: unknown local clipboard rich request, transferId=" +
+            transferId);
+        return;
+    }
+    FileEntry richEntry;
+    richEntry.path = rich->second.richPath;
+    richEntry.name = transferId + richExtension(rich->second.kind);
+    richEntry.size = rich->second.richBytes;
+    FileEntry textEntry;
+    textEntry.path = rich->second.textPath;
+    textEntry.name = transferId + ".txt";
+    textEntry.size = rich->second.textBytes;
+    Logger::write("master: sending local clipboard rich content peer=" +
+                  fromPeerId + ", ip=" + fromPeerIp + ", transferId=" +
+                  transferId + ", bytes=" +
+                  std::to_string(richEntry.size + textEntry.size));
+    m_fileTransfer->sendAsync({richEntry, textEntry}, fromPeerIp,
+                              m_master->peerFilePortByIp(fromPeerIp));
+}
+
 std::vector<FileEntry> Service::executeRemoteFileTransfer(
     const TransferQueue::Task& task, const std::atomic<bool>& cancel) {
-    (void)task;
     if (cancel.load()) {
         return {};
+    }
+    if (!task.metadata.empty() && isImageTransferFile(task.metadata.front())) {
+        const std::string transferId = task.metadata.front().name.substr(
+            0, task.metadata.front().name.size() - 4);
+        if (m_role == "slave" && m_slave != nullptr) {
+            return m_slave->requestClipboardImage(transferId, cancel);
+        }
+        if (m_role == "master" && m_master != nullptr && m_fileTransfer != nullptr) {
+            return requestRemoteImageFromPeer(task.sourceId, transferId, cancel);
+        }
+    }
+    if (!task.metadata.empty() && isRichTransferFile(task.metadata.front())) {
+        const FileEntry& entry = task.metadata.front();
+        const size_t dot = entry.name.find_last_of('.');
+        const std::string transferId = entry.name.substr(0, dot);
+        if (m_role == "slave" && m_slave != nullptr) {
+            return m_slave->requestClipboardRich(transferId, cancel);
+        }
+        if (m_role == "master" && m_master != nullptr && m_fileTransfer != nullptr) {
+            return requestRemoteRichFromPeer(task.sourceId, transferId, cancel);
+        }
     }
     if (m_role == "slave" && m_slave != nullptr) {
         return m_slave->requestClipboardFiles(cancel);
@@ -813,13 +1395,19 @@ void Service::handleTransferQueueEvent(const TransferQueue::Task& task) {
             if (m_clipboard != nullptr) {
                 const uint64_t taskId = task.id;
                 m_clipboard->postClipboardAction([this, taskId]() {
-                    deliverCompletedFiles(taskId);
+                    deliverCompletedTransfer(taskId);
                 });
             }
             break;
         case TransferQueue::State::Failed:
             Logger::write("transfer queue: remote file task failed, task=" +
                           std::to_string(task.id));
+            if (m_pendingConfirmTaskId == task.id) {
+                m_pendingConfirmTaskId = 0;
+                if (m_confirmWindow) {
+                    m_confirmWindow->hide();
+                }
+            }
             break;
         case TransferQueue::State::Cancelled:
             Logger::write("transfer queue: remote file task cancelled, task=" +
@@ -861,7 +1449,7 @@ ClipboardMonitor::RemotePasteResult Service::gateRemotePaste(
     return ClipboardMonitor::RemotePasteResult{};
 }
 
-void Service::deliverCompletedFiles(uint64_t taskId) {
+void Service::deliverCompletedTransfer(uint64_t taskId) {
     if (m_transferQueue == nullptr || m_clipboard == nullptr) {
         return;
     }
@@ -871,8 +1459,44 @@ void Service::deliverCompletedFiles(uint64_t taskId) {
     if (files.empty()) {
         return;
     }
-    if (!m_clipboard->setFilesToClipboard(files, completed.originPeerId,
-                                          completed.originClipboardSequence)) {
+    if (files.size() == 1 && isImageTransferFile(files.front())) {
+        const std::vector<uint8_t> png =
+            readFileBytes(files.front().path, kMaxClipboardImageBytes);
+        if (png.empty() || !m_clipboard->setImageToClipboard(png)) {
+            Logger::write("clipboard: failed to install completed image, task=" +
+                          std::to_string(taskId));
+            return;
+        }
+        DeleteFileA(files.front().path.c_str());
+    } else if (files.size() == 2 && isRichTransferFile(files.front()) &&
+               files.back().name.size() > 4 &&
+               files.back().name.compare(files.back().name.size() - 4, 4,
+                                         ".txt") == 0) {
+        const FileEntry& richEntry = files.front();
+        const std::vector<uint8_t> rich =
+            readFileBytes(richEntry.path, kMaxClipboardRichBytes);
+        const std::vector<uint8_t> text =
+            readFileBytes(files.back().path, kMaxClipboardRichBytes);
+        if (rich.empty()) {
+            Logger::write("clipboard: failed to read completed rich content, task=" +
+                          std::to_string(taskId));
+            return;
+        }
+        const std::string companionText(text.begin(), text.end());
+        const bool rtf = richEntry.name.compare(richEntry.name.size() - 4, 4,
+                                                ".rtf") == 0;
+        const bool installed =
+            rtf ? m_clipboard->setRtfToClipboard(rich, companionText)
+                : m_clipboard->setHtmlToClipboard(rich, companionText);
+        if (!installed) {
+            Logger::write("clipboard: failed to install completed rich content, task=" +
+                          std::to_string(taskId));
+            return;
+        }
+        DeleteFileA(richEntry.path.c_str());
+        DeleteFileA(files.back().path.c_str());
+    } else if (!m_clipboard->setFilesToClipboard(files, completed.originPeerId,
+                                                 completed.originClipboardSequence)) {
         Logger::write("clipboard: failed to install completed transfer, task=" +
                       std::to_string(taskId));
         return;
@@ -959,6 +1583,68 @@ std::vector<FileEntry> Service::requestRemoteFilesFromPeer(
     Logger::write(cancel.load()
                       ? "master: clipboard files request cancelled"
                       : "master: timed out waiting for clipboard files from " + peerId);
+    return {};
+}
+
+std::vector<FileEntry> Service::requestRemoteImageFromPeer(
+    const std::string& peerId, const std::string& transferId,
+    const std::atomic<bool>& cancel) {
+    if (m_master == nullptr || m_fileTransfer == nullptr || peerId.empty() ||
+        transferId.empty()) {
+        Logger::write("master: cannot request remote image, service unavailable");
+        return {};
+    }
+
+    const uint64_t token = m_fileTransfer->beginReceiveWait();
+    if (!m_master->sendClipboardImageRequestTo(peerId, transferId)) {
+        Logger::write("master: cannot request clipboard image from " + peerId +
+                      ", transferId=" + transferId);
+        return {};
+    }
+
+    const uint64_t deadline = GetTickCount64() + 30000;
+    while (!cancel.load() && GetTickCount64() < deadline) {
+        if (m_fileTransfer->waitForReceive(token, 20)) {
+            const FileTransferManager::ReceiveResult result =
+                m_fileTransfer->consumeReceiveResult();
+            return result.success ? result.files : std::vector<FileEntry>{};
+        }
+    }
+    Logger::write(cancel.load()
+                      ? "master: clipboard image request cancelled"
+                      : "master: timed out waiting for clipboard image from " +
+                            peerId);
+    return {};
+}
+
+std::vector<FileEntry> Service::requestRemoteRichFromPeer(
+    const std::string& peerId, const std::string& transferId,
+    const std::atomic<bool>& cancel) {
+    if (m_master == nullptr || m_fileTransfer == nullptr || peerId.empty() ||
+        transferId.empty()) {
+        Logger::write("master: cannot request remote rich content, service unavailable");
+        return {};
+    }
+
+    const uint64_t token = m_fileTransfer->beginReceiveWait();
+    if (!m_master->sendClipboardRichRequestTo(peerId, transferId)) {
+        Logger::write("master: cannot request clipboard rich content from " +
+                      peerId + ", transferId=" + transferId);
+        return {};
+    }
+
+    const uint64_t deadline = GetTickCount64() + 30000;
+    while (!cancel.load() && GetTickCount64() < deadline) {
+        if (m_fileTransfer->waitForReceive(token, 20)) {
+            const FileTransferManager::ReceiveResult result =
+                m_fileTransfer->consumeReceiveResult();
+            return result.success ? result.files : std::vector<FileEntry>{};
+        }
+    }
+    Logger::write(cancel.load()
+                      ? "master: clipboard rich request cancelled"
+                      : "master: timed out waiting for clipboard rich content from " +
+                            peerId);
     return {};
 }
 
@@ -1234,6 +1920,12 @@ nlohmann::json Service::getStatusLocked() {
             clipboardState = "text";
         } else if (snapshot.state == ClipboardMonitor::State::Files) {
             clipboardState = "files";
+        } else if (snapshot.state == ClipboardMonitor::State::Image) {
+            clipboardState = "image";
+        } else if (snapshot.state == ClipboardMonitor::State::Html) {
+            clipboardState = "html";
+        } else if (snapshot.state == ClipboardMonitor::State::Rtf) {
+            clipboardState = "rtf";
         }
     }
 

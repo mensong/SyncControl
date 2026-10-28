@@ -25,6 +25,23 @@ SIZE outerWindowSize() {
     return {frame.right - frame.left, frame.bottom - frame.top};
 }
 
+POINT centeredShowPosition() {
+    const POINT origin{0, 0};
+    const HMONITOR monitor =
+        MonitorFromPoint(origin, MONITOR_DEFAULTTOPRIMARY);
+    MONITORINFO info{};
+    info.cbSize = sizeof(info);
+    if (GetMonitorInfoW(monitor, &info)) {
+        const SIZE size = outerWindowSize();
+        return {info.rcWork.left +
+                    ((info.rcWork.right - info.rcWork.left) - size.cx) / 2,
+                info.rcWork.top +
+                    ((info.rcWork.bottom - info.rcWork.top) - size.cy) / 2};
+    }
+    return {(GetSystemMetrics(SM_CXSCREEN) - kWindowWidth) / 2,
+            (GetSystemMetrics(SM_CYSCREEN) - kWindowHeight) / 2};
+}
+
 std::wstring utf8ToWide(const std::string& utf8) {
     if (utf8.empty()) {
         return {};
@@ -243,9 +260,10 @@ void ConfirmWindow::showNow() {
     }
     updateContent(source, count, bytes, names);
     m_hasTask.store(true);
+    const POINT position = centeredShowPosition();
+    SetWindowPos(m_window, HWND_TOPMOST, position.x, position.y, 0, 0,
+                 SWP_NOSIZE | SWP_NOACTIVATE);
     ShowWindow(m_window, SW_SHOWNOACTIVATE);
-    SetWindowPos(m_window, HWND_TOPMOST, 0, 0, 0, 0,
-                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
 }
 
 void ConfirmWindow::hideNow() {
