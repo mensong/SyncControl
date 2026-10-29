@@ -160,6 +160,7 @@ void persistMasterLayout(const ScreenLayout& layout) {
 }
 
 struct ServiceSettings {
+    std::string role = "master";
     std::string bindIp = "0.0.0.0";
     uint16_t port = 19881;
     std::string masterIp;
@@ -190,6 +191,7 @@ ServiceSettings loadServiceSettings() {
     try {
         nlohmann::json value;
         file >> value;
+        settings.role = value.value("role", settings.role);
         settings.bindIp = value.value("bindIp", settings.bindIp);
         settings.port = static_cast<uint16_t>(value.value("port", 19881));
         settings.masterIp = value.value("masterIp", std::string());
@@ -431,6 +433,19 @@ bool Service::startSavedSlave() {
     const ServiceSettings settings = loadServiceSettings();
     applySecurityKey(settings.securityKey);
     return startSlave(settings.slavePort, settings.masterIp, settings.masterPort);
+}
+
+bool Service::startSavedService(const std::string& requestedRole) {
+    const ServiceSettings settings = loadServiceSettings();
+    const std::string& role = requestedRole.empty() ? settings.role : requestedRole;
+    if (role == "master") {
+        return startSavedMaster();
+    }
+    if (role == "slave") {
+        return startSavedSlave();
+    }
+    Logger::write("service: unknown configured role " + role);
+    return false;
 }
 
 bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::string& masterId,
@@ -1823,7 +1838,7 @@ nlohmann::json Service::handleIpc(const nlohmann::json& command) {
         return {{"type", "ok"}, {"accepted", type}};
     }
     if (type == "start_master" || type == "start_slave" || type == "stop" ||
-        type == "update_layout") {
+        type == "update_layout" || type == "exit") {
         {
             std::lock_guard<std::mutex> lock(m_commandMutex);
             m_ipcCommands.push(command);
@@ -1973,6 +1988,9 @@ void Service::processIpcCommands() {
                        static_cast<uint16_t>(command.value("masterPort", 19881)));
         } else if (type == "stop") {
             stopMode();
+        } else if (type == "exit") {
+            stopMode();
+            m_running = false;
         } else if (type == "update_layout") {
             const auto layoutIt = command.find("layout");
             if (layoutIt == command.end() || !layoutIt->is_object()) {

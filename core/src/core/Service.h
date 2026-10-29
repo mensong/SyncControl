@@ -34,6 +34,7 @@ public:
     bool startSavedSlave();
     bool startSlave(uint16_t localPort, const std::string& masterIp,
                     uint16_t masterPort);
+    bool startSavedService(const std::string& requestedRole = std::string());
     void stopMode();
     void run();
 

@@ -52,23 +52,16 @@ int main(int argc, char** argv) {
         }
     }
 
-    bool started = true;
     if (master && slave) {
         std::cerr << "Choose either --master or --slave\n";
         return 2;
     }
-    if (master) {
-        // Restore the last accepted master layout on boot. If none exists,
-        // remain as an idle IPC service until the GUI sends start_master.
-        if (!service.startSavedMaster()) {
-            started = true;
-        }
-    } else if (slave) {
-        started = service.startSavedSlave();
-    }
+    const bool started = master ? service.startSavedService("master")
+                       : slave ? service.startSavedService("slave")
+                               : service.startSavedService();
 
     if (!started) {
-        std::cerr << "Failed to start requested mode\n";
+        std::cerr << "Failed to start saved service mode\n";
         return 1;
     }
 

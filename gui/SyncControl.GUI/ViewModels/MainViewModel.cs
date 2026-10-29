@@ -35,6 +35,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private CancellationTokenSource? _layoutUpdateCts;
     private string _lastTransferFileName = string.Empty;
     private bool _settingsOpen;
+    private bool _serviceStopping;
 
     [ObservableProperty]
     private string _statusText = "就绪";
@@ -219,10 +220,15 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
                 return;
             }
             FileLogger.Error("IPC connection lost");
+            if (_serviceStopping)
+            {
+                return;
+            }
             if (IsRunning)
             {
                 IsServiceError = true;
                 StatusText = "C++ 服务已崩溃，可重启服务";
+                ResetServiceState();
             }
             else
             {
@@ -291,6 +297,10 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private async Task StartServiceAsync()
     {
         PersistServiceConfig();
+        if (SelectedRole == "master" && !PersistMasterLayoutForCore())
+        {
+            return;
+        }
         StatusText = "正在启动控制...";
 
         if (!await _serviceManager.StartAsync(SelectedRole))
@@ -301,61 +311,84 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         }
 
         StatusText = "正在连接 C++ 服务...";
-        if (!await _ipc.WaitForReadyAsync())
+        if (!await WaitForCoreServiceAsync())
         {
-            StatusText = "启动失败: 无法连接 SyncControl IPC";
-            FileLogger.Error("IPC did not become ready after starting the C++ service");
+            _serviceManager.Stop();
+            IsServiceError = true;
+            StatusText = "启动失败: Core 自动恢复服务未成功";
+            FileLogger.Error("Core did not report a running saved service");
             return;
         }
 
-        JsonObject command;
-        if (SelectedRole == "master")
-        {
-            var layout = RoutingBuilder.Build(Screens).Layout;
-            command = new JsonObject
-            {
-                ["type"] = "start_master",
-                ["layout"] = JsonNode.Parse(JsonSerializer.Serialize(layout, JsonOptions)),
-                ["bindIp"] = BindIp,
-                ["port"] = Port,
-                ["securityKey"] = SecurityKey,
-            };
-        }
-        else
-        {
-            command = new JsonObject
-            {
-                ["type"] = "start_slave",
-                ["localPort"] = SlavePort,
-                ["masterIp"] = MasterIp.Trim(),
-                ["masterPort"] = MasterPort,
-                ["securityKey"] = SecurityKey,
-            };
-        }
-
-        var response = await _ipc.SendAsync(command);
-        if (response.Success)
-        {
-            IsRunning = true;
-            StatusText = SelectedRole == "master" ? "主控模式已启动" : "被控模式已启动";
-        }
-        else
-        {
-            StatusText = "启动失败: 无法连接 SyncControl IPC";
-        }
+        IsRunning = true;
+        Role = SelectedRole;
+        IsServiceError = false;
+        StatusText = SelectedRole == "master" ? "主控模式已启动" : "被控模式已启动";
     }
 
     [RelayCommand]
     private async Task StopServiceAsync()
     {
-        var response = await _ipc.SendAsync(new JsonObject { ["type"] = "stop" });
-        IsRunning = false;
-        _connectedPeerIds.Clear();
-        foreach (var peer in Screens.Where(node => !node.IsMaster))
+        _serviceStopping = true;
+        try
         {
-            peer.ConnectionStatus = ConnectionStatus.Offline;
+            var response = await _ipc.SendAsync(new JsonObject { ["type"] = "exit" });
+            await _serviceManager.StopAsync();
+            ResetServiceState();
+            IsServiceError = false;
+            StatusText = response.Success ? "服务已停止" : "服务已停止（未收到退出确认）";
         }
-        StatusText = response.Success ? "服务已停止" : "停止指令未送达";
+        finally
+        {
+            _serviceStopping = false;
+        }
+    }
+
+    private async Task<bool> WaitForCoreServiceAsync()
+    {
+        var deadline = Environment.TickCount64 + 5000;
+        while (Environment.TickCount64 < deadline)
+        {
+            if (!_serviceManager.IsRunning)
+            {
+                return false;
+            }
+
+            var response = await _ipc.SendAsync(new JsonObject { ["type"] = "get_status" });
+            if (response.Success &&
+                response.Response?["running"]?.GetValue<bool>() == true &&
+                response.Response?["role"]?.GetValue<string>() == SelectedRole)
+            {
+                return true;
+            }
+
+            await Task.Delay(50);
+        }
+
+        return false;
+    }
+
+    private bool PersistMasterLayoutForCore()
+    {
+        try
+        {
+            var directory = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SyncControl");
+            Directory.CreateDirectory(directory);
+            var layout = RoutingBuilder.Build(Screens).Layout;
+            File.WriteAllText(
+                Path.Combine(directory, "master-layout.json"),
+                JsonSerializer.Serialize(layout, JsonOptions),
+                new UTF8Encoding(false));
+            return true;
+        }
+        catch (Exception error)
+        {
+            StatusText = $"启动失败: 无法保存 Core 布局 ({error.Message})";
+            FileLogger.Error("persist core master layout failed", error);
+            return false;
+        }
     }
 
     [RelayCommand]
@@ -363,8 +396,17 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     {
         StatusText = "正在重启 C++ 服务...";
         FileLogger.Info("restarting C++ service");
-        _serviceManager.Stop();
-        var resume = IsRunning;
+        _serviceStopping = true;
+        try
+        {
+            await _ipc.SendAsync(new JsonObject { ["type"] = "exit" });
+            ResetServiceState();
+            await _serviceManager.StopAsync();
+        }
+        finally
+        {
+            _serviceStopping = false;
+        }
         if (!await _serviceManager.StartAsync(SelectedRole))
         {
             IsServiceError = true;
@@ -372,11 +414,25 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             FileLogger.Error("service restart failed: core executable missing");
             return;
         }
-        if (resume)
+
+        PersistServiceConfig();
+        if (SelectedRole == "master" && !PersistMasterLayoutForCore())
         {
-            await StartServiceAsync();
+            IsServiceError = true;
             return;
         }
+
+        if (!await WaitForCoreServiceAsync())
+        {
+            _serviceManager.Stop();
+            IsServiceError = true;
+            StatusText = "重启失败: Core 自动恢复服务未成功";
+            FileLogger.Error("service restart failed: core did not report running");
+            return;
+        }
+
+        IsRunning = true;
+        Role = SelectedRole;
         IsServiceError = false;
         StatusText = "服务已重启";
     }
@@ -419,6 +475,16 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         {
             // Keep the registered Core arguments in sync with the selected role.
             AutostartManager.SetEnabled(true, slaveMode: SelectedRole == "slave");
+        }
+    }
+
+    private void ResetServiceState()
+    {
+        IsRunning = false;
+        _connectedPeerIds.Clear();
+        foreach (var peer in Screens.Where(node => !node.IsMaster))
+        {
+            peer.ConnectionStatus = ConnectionStatus.Offline;
         }
     }
 

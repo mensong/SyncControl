@@ -75,6 +75,36 @@ public sealed class ServiceManager : IDisposable
         _process = null;
     }
 
+    public async Task StopAsync(int gracefulTimeoutMs = 3000)
+    {
+        var process = _process;
+        if (process is null || process.HasExited)
+        {
+            process = FindRunningCore();
+            if (process is not null)
+            {
+                _process = process;
+            }
+        }
+
+        if (process is { HasExited: false } && gracefulTimeoutMs > 0)
+        {
+            using var timeout = new CancellationTokenSource(gracefulTimeoutMs);
+            try
+            {
+                await process.WaitForExitAsync(timeout.Token);
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (InvalidOperationException)
+            {
+            }
+        }
+
+        Stop();
+    }
+
     public void Detach()
     {
         // Closing the manager must not stop a shared Core instance. Explicit
