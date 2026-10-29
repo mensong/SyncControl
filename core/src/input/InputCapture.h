@@ -79,6 +79,9 @@ private:
     void moveRemote(int deltaX, int deltaY);
     void handleRemoteEdge();
     void returnToLocal(const RouteTarget& target);
+    void returnToLocalCenter();
+    void returnToLocalAt(int x, int y);
+    void releaseRemoteHotkeyModifiers();
     void hideCursor();
     void showCursor();
     void showCursorCover(const POINT& point);
@@ -97,6 +100,8 @@ private:
     ATOM m_windowClassAtom = 0;
     Focus m_focus = Focus::Local;
     std::string m_focusPeerId;
+    bool m_returnHotkeyCtrlDown = false;
+    bool m_returnHotkeyAltDown = false;
     Edge m_remoteEntryEdge = Edge::Top;
     double m_remoteX = 0;
     double m_remoteY = 0;

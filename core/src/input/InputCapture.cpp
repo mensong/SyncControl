@@ -57,6 +57,8 @@ bool InputCapture::start(const Callbacks& callbacks) {
     s_instance = this;
     m_callbacks = callbacks;
     m_focus = Focus::Local;
+    m_returnHotkeyCtrlDown = false;
+    m_returnHotkeyAltDown = false;
     m_systemCursorHidden = false;
     m_rawInputSkipCount = 0;
     refreshPointerSettings();
@@ -333,6 +335,47 @@ LRESULT InputCapture::handleKeyboardHook(WPARAM wParam, const KBDLLHOOKSTRUCT* i
         return CallNextHookEx(nullptr, 0, wParam, reinterpret_cast<LPARAM>(info));
     }
 
+    const bool isKeyEvent = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN ||
+                            wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+    const bool isKeyDown = wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN;
+    const bool isKeyUp = wParam == WM_KEYUP || wParam == WM_SYSKEYUP;
+    if (isKeyEvent) {
+        if (isKeyDown) {
+            if (info->vkCode == VK_LCONTROL || info->vkCode == VK_RCONTROL) {
+                m_returnHotkeyCtrlDown = true;
+            } else if (info->vkCode == VK_LMENU || info->vkCode == VK_RMENU) {
+                m_returnHotkeyAltDown = true;
+            }
+        } else if (isKeyUp) {
+            if (info->vkCode == VK_LCONTROL || info->vkCode == VK_RCONTROL) {
+                m_returnHotkeyCtrlDown = false;
+            } else if (info->vkCode == VK_LMENU || info->vkCode == VK_RMENU) {
+                m_returnHotkeyAltDown = false;
+            }
+        }
+    }
+
+    if (isKeyEvent && isKeyDown && info->vkCode == VK_HOME) {
+        const bool trackedCtrlDown = m_returnHotkeyCtrlDown;
+        const bool trackedAltDown = m_returnHotkeyAltDown;
+        const bool asyncCtrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        const bool asyncAltDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+        Logger::write("input: return hotkey Home keydown focus=" +
+                      std::string(m_focus == Focus::Remote ? "remote" : "local") +
+                      " trackedCtrl=" + std::to_string(trackedCtrlDown) +
+                      " trackedAlt=" + std::to_string(trackedAltDown) +
+                      " asyncCtrl=" + std::to_string(asyncCtrlDown) +
+                      " asyncAlt=" + std::to_string(asyncAltDown));
+        if ((trackedCtrlDown || asyncCtrlDown) && (trackedAltDown || asyncAltDown)) {
+            if (m_focus == Focus::Remote) {
+                Logger::write("input: return hotkey triggered peer=" + m_focusPeerId);
+                releaseRemoteHotkeyModifiers();
+                returnToLocalCenter();
+            }
+        }
+        return 1;
+    }
+
     if (m_focus == Focus::Remote) {
         if (wParam == WM_KEYDOWN || wParam == WM_SYSKEYDOWN) {
             m_callbacks.sendKeyEvent(true, static_cast<uint16_t>(info->vkCode),
@@ -556,21 +599,6 @@ void InputCapture::handleRemoteEdge() {
 }
 
 void InputCapture::returnToLocal(const RouteTarget& target) {
-    if (m_callbacks.clipboardSync && !m_focusPeerId.empty()) {
-        m_callbacks.clipboardSync(m_focusPeerId, std::string());
-    }
-    if (m_callbacks.sendSwitchOut && !m_focusPeerId.empty()) {
-        m_callbacks.sendSwitchOut(m_focusPeerId);
-    }
-    m_focus = Focus::Local;
-    m_focusPeerId.clear();
-    m_remoteEntryEdge = Edge::Top;
-    m_remoteWidth = 0;
-    m_remoteHeight = 0;
-    m_remoteX = 0;
-    m_remoteY = 0;
-    m_remoteEntered = false;
-
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     int x = target.entryX;
@@ -589,8 +617,53 @@ void InputCapture::returnToLocal(const RouteTarget& target) {
             y = screenH - 1 - kReturnCursorInset;
             break;
     }
+    returnToLocalAt(x, y);
+}
+
+void InputCapture::returnToLocalCenter() {
+    const int screenW = GetSystemMetrics(SM_CXSCREEN);
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
+    returnToLocalAt(screenW / 2, screenH / 2);
+}
+
+void InputCapture::returnToLocalAt(int x, int y) {
+    if (m_callbacks.clipboardSync && !m_focusPeerId.empty()) {
+        m_callbacks.clipboardSync(m_focusPeerId, std::string());
+    }
+    if (m_callbacks.sendSwitchOut && !m_focusPeerId.empty()) {
+        m_callbacks.sendSwitchOut(m_focusPeerId);
+    }
+    m_focus = Focus::Local;
+    m_focusPeerId.clear();
+    m_remoteEntryEdge = Edge::Top;
+    m_remoteWidth = 0;
+    m_remoteHeight = 0;
+    m_remoteX = 0;
+    m_remoteY = 0;
+    m_remoteEntered = false;
+
+    const int screenW = GetSystemMetrics(SM_CXSCREEN);
+    const int screenH = GetSystemMetrics(SM_CYSCREEN);
     SetCursorPos(clampToRange(x, screenW - 1), clampToRange(y, screenH - 1));
     showCursor();
+}
+
+void InputCapture::releaseRemoteHotkeyModifiers() {
+    const struct {
+        UINT vkCode;
+        bool extendedKey;
+    } keys[] = {
+        {VK_LCONTROL, false},
+        {VK_RCONTROL, true},
+        {VK_LMENU, false},
+        {VK_RMENU, true},
+    };
+
+    for (const auto& key : keys) {
+        const UINT scanCode = MapVirtualKeyW(key.vkCode, MAPVK_VK_TO_VSC);
+        m_callbacks.sendKeyEvent(false, static_cast<uint16_t>(key.vkCode),
+                                 static_cast<uint16_t>(scanCode), key.extendedKey);
+    }
 }
 
 void InputCapture::hideCursor() {
