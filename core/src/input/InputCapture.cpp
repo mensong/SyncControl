@@ -1,6 +1,7 @@
 #include "input/InputCapture.h"
 
 #include <algorithm>
+#include <cmath>
 #include <vector>
 
 #include "core/Logger.h"
@@ -57,8 +58,8 @@ bool InputCapture::start(const Callbacks& callbacks) {
     m_callbacks = callbacks;
     m_focus = Focus::Local;
     m_systemCursorHidden = false;
-    m_lastHookPointValid = false;
     m_rawInputSkipCount = 0;
+    refreshPointerSettings();
     m_hookOverrunCount = 0;
     m_hookMaxMicroseconds = 0;
 
@@ -237,6 +238,9 @@ LRESULT CALLBACK InputCapture::windowProc(HWND window, UINT message,
     if (s_instance != nullptr && message == WM_INPUT) {
         s_instance->handleRawInput(reinterpret_cast<HRAWINPUT>(lParam));
     }
+    if (s_instance != nullptr && message == WM_SETTINGCHANGE) {
+        s_instance->refreshPointerSettings();
+    }
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
@@ -406,8 +410,7 @@ bool InputCapture::trySwitchToRemote(Edge edge, const POINT& point, float ratio)
     m_lastAbsoluteX = -1;
     m_lastAbsoluteY = -1;
     m_lastAbsoluteTickMs = 0;
-    m_lastHookPoint = point;
-    m_lastHookPointValid = true;
+    refreshPointerSettings();
 
     m_focus = Focus::Remote;
     hideCursor();
@@ -418,13 +421,66 @@ bool InputCapture::trySwitchToRemote(Edge edge, const POINT& point, float ratio)
     return true;
 }
 
+void InputCapture::refreshPointerSettings() {
+    UINT pointerSpeed = 10;
+    if (!SystemParametersInfoW(SPI_GETMOUSESPEED, 0, &pointerSpeed, 0)) {
+        pointerSpeed = 10;
+    }
+    m_pointerSpeedMultiplier =
+        static_cast<double>(std::clamp<UINT>(pointerSpeed, 1, 20)) / 10.0;
+
+    int mouseSettings[3] = {6, 10, 0};
+    if (SystemParametersInfoW(SPI_GETMOUSE, 0, mouseSettings, 0)) {
+        m_pointerAccelerationThreshold1 =
+            static_cast<double>(std::clamp(mouseSettings[0], 0, 1000));
+        m_pointerAccelerationThreshold2 =
+            static_cast<double>(std::clamp(mouseSettings[1], 0, 1000));
+        m_pointerAccelerationLevel =
+            static_cast<double>(std::clamp(mouseSettings[2], 0, 2));
+    } else {
+        m_pointerAccelerationThreshold1 = 6.0;
+        m_pointerAccelerationThreshold2 = 10.0;
+        m_pointerAccelerationLevel = 0.0;
+    }
+    m_lastPointerSettingsRefreshMs = GetTickCount64();
+}
+
 void InputCapture::moveRemote(int deltaX, int deltaY) {
     if (m_remoteWidth == 0 || m_remoteHeight == 0) {
         return;
     }
 
-    m_remoteX = std::clamp(m_remoteX + deltaX, 0, static_cast<int>(m_remoteWidth - 1));
-    m_remoteY = std::clamp(m_remoteY + deltaY, 0, static_cast<int>(m_remoteHeight - 1));
+    double compensatedX = static_cast<double>(deltaX) * m_pointerSpeedMultiplier;
+    double compensatedY = static_cast<double>(deltaY) * m_pointerSpeedMultiplier;
+    if (m_pointerAccelerationLevel > 0.0) {
+        const double distance = std::max(std::abs(deltaX), std::abs(deltaY));
+        double acceleration = 1.0;
+        if (distance > m_pointerAccelerationThreshold2) {
+            acceleration = 2.0;
+        } else if (distance > m_pointerAccelerationThreshold1) {
+            acceleration = 1.5;
+        }
+        compensatedX *= acceleration;
+        compensatedY *= acceleration;
+    }
+
+    const int localWidth = GetSystemMetrics(SM_CXSCREEN);
+    const int localHeight = GetSystemMetrics(SM_CYSCREEN);
+    const double scaleX = localWidth > 0
+                              ? static_cast<double>(m_remoteWidth) / localWidth
+                              : 1.0;
+    const double scaleY = localHeight > 0
+                              ? static_cast<double>(m_remoteHeight) / localHeight
+                              : 1.0;
+
+    m_remoteX = std::clamp(m_remoteX + compensatedX * scaleX, 0.0,
+                           static_cast<double>(m_remoteWidth - 1));
+    m_remoteY = std::clamp(m_remoteY + compensatedY * scaleY, 0.0,
+                           static_cast<double>(m_remoteHeight - 1));
+    const auto remoteX = clampToRange(
+        static_cast<int>(std::lround(m_remoteX)), m_remoteWidth - 1);
+    const auto remoteY = clampToRange(
+        static_cast<int>(std::lround(m_remoteY)), m_remoteHeight - 1);
     if (!m_remoteEntered) {
         switch (m_remoteEntryEdge) {
             case Edge::Left:
@@ -441,11 +497,11 @@ void InputCapture::moveRemote(int deltaX, int deltaY) {
                 break;
         }
     }
-    m_callbacks.sendMouseMove(static_cast<uint16_t>(m_remoteX),
-                              static_cast<uint16_t>(m_remoteY));
+    m_callbacks.sendMouseMove(static_cast<uint16_t>(remoteX),
+                              static_cast<uint16_t>(remoteY));
     if (!m_remoteMoveLogged && (deltaX != 0 || deltaY != 0)) {
         Logger::write("input: queued first remote mouse move at " +
-                      std::to_string(m_remoteX) + "," + std::to_string(m_remoteY));
+                      std::to_string(remoteX) + "," + std::to_string(remoteY));
         m_remoteMoveLogged = true;
     }
     if (m_remoteEntered) {
@@ -458,7 +514,11 @@ void InputCapture::handleRemoteEdge() {
         return;
     }
 
-    const EdgeHit hit = detectEdge(m_remoteX, m_remoteY, m_remoteWidth, m_remoteHeight);
+    const int remoteX = clampToRange(
+        static_cast<int>(std::lround(m_remoteX)), m_remoteWidth - 1);
+    const int remoteY = clampToRange(
+        static_cast<int>(std::lround(m_remoteY)), m_remoteHeight - 1);
+    const EdgeHit hit = detectEdge(remoteX, remoteY, m_remoteWidth, m_remoteHeight);
     if (!hit.atEdge || !m_callbacks.lookupRoute) {
         return;
     }
@@ -491,6 +551,7 @@ void InputCapture::handleRemoteEdge() {
         m_remoteEntryEdge = target.toEdge;
         m_remoteEntered = false;
         m_rawInputSkipCount = 1;
+        refreshPointerSettings();
     }
 }
 
@@ -508,7 +569,6 @@ void InputCapture::returnToLocal(const RouteTarget& target) {
     m_remoteHeight = 0;
     m_remoteX = 0;
     m_remoteY = 0;
-    m_lastHookPointValid = false;
     m_remoteEntered = false;
 
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
@@ -635,6 +695,10 @@ void InputCapture::handleRawInput(HRAWINPUT input) {
         return;
     }
     ++m_rawInputRemoteCount;
+    const uint64_t nowMs = GetTickCount64();
+    if (nowMs - m_lastPointerSettingsRefreshMs >= 1000) {
+        refreshPointerSettings();
+    }
     if (!m_remoteInputModeLogged) {
         const bool absolute = (mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0;
         Logger::write(std::string("input: raw mouse mode=") +
@@ -646,7 +710,6 @@ void InputCapture::handleRawInput(HRAWINPUT input) {
     }
 
     if ((mouse.usFlags & MOUSE_MOVE_ABSOLUTE) != 0) {
-        const uint64_t nowMs = GetTickCount64();
         const bool valid = raw->header.hDevice == m_lastAbsoluteDevice &&
                            m_lastAbsoluteX >= 0 && m_lastAbsoluteY >= 0 &&
                            nowMs - m_lastAbsoluteTickMs <= kAbsoluteResetMs;

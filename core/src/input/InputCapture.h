@@ -75,6 +75,7 @@ private:
     void handleRawInput(HRAWINPUT input);
 
     bool trySwitchToRemote(Edge edge, const POINT& point, float ratio);
+    void refreshPointerSettings();
     void moveRemote(int deltaX, int deltaY);
     void handleRemoteEdge();
     void returnToLocal(const RouteTarget& target);
@@ -95,16 +96,18 @@ private:
     HHOOK m_keyboardHook = nullptr;
     ATOM m_windowClassAtom = 0;
     Focus m_focus = Focus::Local;
-    POINT m_lastHookPoint{};
     std::string m_focusPeerId;
     Edge m_remoteEntryEdge = Edge::Top;
-    int m_remoteX = 0;
-    int m_remoteY = 0;
+    double m_remoteX = 0;
+    double m_remoteY = 0;
+    double m_pointerSpeedMultiplier = 1.0;
+    double m_pointerAccelerationThreshold1 = 6.0;
+    double m_pointerAccelerationThreshold2 = 10.0;
+    double m_pointerAccelerationLevel = 0.0;
     uint16_t m_remoteWidth = 0;
     uint16_t m_remoteHeight = 0;
     bool m_systemCursorHidden = false;
     bool m_rawInputRegistered = false;
-    bool m_lastHookPointValid = false;
     UINT m_rawInputSkipCount = 0;
     bool m_remoteEntered = false;
     HCURSOR m_blankCursor = nullptr;
@@ -117,6 +120,7 @@ private:
     uint64_t m_rawInputMoveCount = 0;
     uint64_t m_hookRemoteMoveCount = 0;
     uint64_t m_lastRawInputTickMs = 0;
+    uint64_t m_lastPointerSettingsRefreshMs = 0;
     bool m_rawInputFailureLogged = false;
     bool m_rawInputDeliveryLogged = false;
     bool m_remoteInputModeLogged = false;
