@@ -46,6 +46,11 @@ void TransferQueue::stop() {
     }
 }
 
+void TransferQueue::setCancelFn(CancelFn cancel) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_cancelFn = std::move(cancel);
+}
+
 TransferQueue::OfferResult TransferQueue::offerBatch(
     const std::vector<FileEntry>& metadata, const std::string& sourceId,
     const std::string& originPeerId, uint32_t originClipboardSequence,
@@ -149,6 +154,7 @@ bool TransferQueue::confirm(uint64_t taskId) {
 
 bool TransferQueue::cancel(uint64_t taskId) {
     bool changed = false;
+    Task cancelledActiveTask;
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         Task* task = findTaskLocked(taskId);
@@ -160,13 +166,64 @@ bool TransferQueue::cancel(uint64_t taskId) {
             changed = true;
         } else if (task->state == State::Active && task->cancel) {
             task->cancel->store(true);
+            cancelledActiveTask = *task;
+            m_workerWake.notify_all();
         }
+    }
+    if (cancelledActiveTask.id && m_cancelFn) {
+        m_cancelFn(cancelledActiveTask);
     }
     if (changed) {
         std::lock_guard<std::mutex> lock(m_mutex);
         if (Task* task = findTaskLocked(taskId)) {
             emitEvent(*task);
         }
+    }
+    return changed;
+}
+
+bool TransferQueue::completeExternal(uint64_t taskId,
+                                     std::vector<FileEntry> files) {
+    bool changed = false;
+    Task completed;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        Task* task = findTaskLocked(taskId);
+        if (task != nullptr && task->state == State::Active) {
+            task->result = std::move(files);
+            if (task->result.empty()) {
+                task->result.clear();
+                task->state = State::Failed;
+            } else {
+                task->state = State::Completed;
+            }
+            completed = *task;
+            changed = true;
+            m_workerWake.notify_all();
+        }
+    }
+    if (changed) {
+        emitEvent(completed);
+    }
+    return changed;
+}
+
+bool TransferQueue::failExternal(uint64_t taskId) {
+    bool changed = false;
+    Task failed;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        Task* task = findTaskLocked(taskId);
+        if (task != nullptr && task->state == State::Active) {
+            task->result.clear();
+            task->state = State::Failed;
+            failed = *task;
+            changed = true;
+            m_workerWake.notify_all();
+        }
+    }
+    if (changed) {
+        emitEvent(failed);
     }
     return changed;
 }
@@ -292,8 +349,29 @@ void TransferQueue::workerLoop() {
                     Task* task = findTaskLocked(taskId);
                     return task != nullptr ? *task : Task{};
                 }();
-                files = m_execute(snapshot, *cancel);
+                ExecuteResult execution = m_execute(snapshot, *cancel);
                 wasCancelled = cancel->load();
+                if (execution.outcome == ExecuteResult::Outcome::ExternalPending) {
+                    std::unique_lock<std::mutex> externalLock(m_mutex);
+                    m_workerWake.wait(externalLock, [this, taskId]() {
+                        Task* task = findTaskLocked(taskId);
+                        return task == nullptr || task->state != State::Active ||
+                               task->cancel->load();
+                    });
+                    Task* task = findTaskLocked(taskId);
+                    if (task != nullptr && task->state == State::Active &&
+                        task->cancel->load()) {
+                        task->state = State::Cancelled;
+                        task->result.clear();
+                        Logger::write("transfer queue: task=" +
+                                      std::to_string(task->id) + " cancelled");
+                        const Task cancelled = *task;
+                        externalLock.unlock();
+                        emitEvent(cancelled);
+                    }
+                    continue;
+                }
+                files = std::move(execution.files);
             }
         }
 

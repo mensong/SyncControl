@@ -73,9 +73,17 @@ public:
         std::vector<FileEntry> files;
     };
 
-    using ExecuteFn = std::function<std::vector<FileEntry>(
-        const Task&, const std::atomic<bool>&)>;
+    struct ExecuteResult {
+        enum class Outcome { Completed, ExternalPending, Failed };
+
+        Outcome outcome = Outcome::Failed;
+        std::vector<FileEntry> files;
+    };
+
     using EventFn = std::function<void(const Task&)>;
+    using ExecuteFn = std::function<ExecuteResult(
+        const Task&, const std::atomic<bool>&)>;
+    using CancelFn = std::function<void(const Task&)>;
 
     TransferQueue() = default;
     ~TransferQueue();
@@ -85,6 +93,7 @@ public:
 
     void start(ExecuteFn execute, EventFn event);
     void stop();
+    void setCancelFn(CancelFn cancel);
 
     OfferResult offerBatch(const std::vector<FileEntry>& metadata,
                            const std::string& sourceId,
@@ -94,6 +103,8 @@ public:
                            uint16_t sourcePort);
     bool confirm(uint64_t taskId);
     bool cancel(uint64_t taskId);
+    bool completeExternal(uint64_t taskId, std::vector<FileEntry> files);
+    bool failExternal(uint64_t taskId);
     PasteDecision decidePaste(const std::vector<FileEntry>& metadata) const;
     CompletedFiles takeCompletedFiles(uint64_t taskId);
     QueueStats stats() const;
@@ -108,6 +119,7 @@ private:
 
     ExecuteFn m_execute;
     EventFn m_event;
+    CancelFn m_cancelFn;
     std::deque<Task> m_tasks;
     mutable std::mutex m_mutex;
     std::condition_variable m_workerWake;

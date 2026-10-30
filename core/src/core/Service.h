@@ -74,9 +74,13 @@ private:
     void handleRemoteRichBatch(const std::string& sourceId,
                                const std::string& sourceIp,
                                const ClipboardRichMeta& meta);
-    std::vector<FileEntry> executeRemoteFileTransfer(const TransferQueue::Task& task,
-                                                     const std::atomic<bool>& cancel);
+    TransferQueue::ExecuteResult executeRemoteFileTransfer(
+        const TransferQueue::Task& task, const std::atomic<bool>& cancel);
+    TransferQueue::ExecuteResult waitForExternalFileTransfer(
+        uint64_t taskId, const std::atomic<bool>& cancel);
     void handleTransferQueueEvent(const TransferQueue::Task& task);
+    void handleReceiveCompleted(bool success, std::vector<FileEntry> files);
+    void cancelExternalFileTransfer(const TransferQueue::Task& task);
     ClipboardMonitor::RemotePasteResult gateRemotePaste(
         const std::vector<FileEntry>& metadata);
     void deliverCompletedTransfer(uint64_t taskId);
@@ -84,8 +88,7 @@ private:
     void handleTransferProgress(const FileTransferManager::Status& status);
     bool isLocalPeerId(const std::string& peerId);
     void reauthenticatePeers();
-    std::vector<FileEntry> requestRemoteFilesFromPeer(const std::string& peerId,
-                                                      const std::atomic<bool>& cancel);
+    bool beginRemoteFilesFromPeer(const std::string& peerId);
     std::vector<FileEntry> requestRemoteImageFromPeer(
         const std::string& peerId, const std::string& transferId,
         const std::atomic<bool>& cancel);
@@ -114,6 +117,8 @@ private:
     std::mutex m_stateMutex;
     std::mutex m_commandMutex;
     std::mutex m_layoutMutex;
+    std::mutex m_activeFileMutex;
+    uint64_t m_activeFileTaskId = 0;
     ScreenLayout m_layout;
     std::string m_masterScreenId;
     std::string m_masterIp;

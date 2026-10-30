@@ -20,6 +20,7 @@ namespace {
 
 constexpr wchar_t kWindowClassName[] = L"SyncControlClipboardWindow";
 constexpr int kOpenRetryCount = 50;
+constexpr int kMetaOpenAttempts = 5;
 constexpr DWORD kOpenRetryDelayMs = 20;
 constexpr size_t kMaxClipboardFiles = 100000;
 constexpr int kMaxDirectoryDepth = 32;
@@ -313,9 +314,10 @@ std::string readUnicodeTextFromClipboard() {
     return result;
 }
 
-bool openClipboardWithRetry(HWND owner, const char* operation) {
+bool openClipboardWithRetry(HWND owner, const char* operation,
+                            int attempts = kOpenRetryCount) {
     DWORD lastError = 0;
-    for (int attempt = 0; attempt < kOpenRetryCount; ++attempt) {
+    for (int attempt = 0; attempt < attempts; ++attempt) {
         if (OpenClipboard(owner)) {
             return true;
         }
@@ -323,7 +325,7 @@ bool openClipboardWithRetry(HWND owner, const char* operation) {
         Sleep(kOpenRetryDelayMs);
     }
     Logger::write(std::string("clipboard: OpenClipboard failed, operation=") +
-                  operation + ", attempts=" + std::to_string(kOpenRetryCount) +
+                  operation + ", attempts=" + std::to_string(attempts) +
                   ", win32Error=" + std::to_string(static_cast<uint32_t>(lastError)));
     return false;
 }
@@ -594,6 +596,28 @@ void ClipboardMonitor::clearRemoteClipboardState() {
         std::lock_guard<std::mutex> lock(m_mutex);
         m_cache = {};
     }
+}
+
+void ClipboardMonitor::clearPendingRemoteFiles() {
+    m_hasPendingRemoteFiles = false;
+    m_renderingFiles = false;
+    {
+        std::lock_guard<std::mutex> lock(m_pendingMutex);
+        m_pendingRemoteFiles.clear();
+    }
+    // Only wipe the clipboard when it still holds exactly what this window
+    // installed; a changed sequence means newer local content must be kept.
+    if (m_window == nullptr || GetClipboardOwner() != m_window ||
+        GetClipboardSequenceNumber() != m_expectedClipboardSequence) {
+        return;
+    }
+    if (!openClipboardWithRetry(m_window, "clear remote file metadata",
+                                kMetaOpenAttempts)) {
+        return;
+    }
+    EmptyClipboard();
+    CloseClipboard();
+    Logger::write("clipboard: cleared remote file metadata after dismiss");
 }
 
 void ClipboardMonitor::stop() {
@@ -1066,7 +1090,8 @@ bool ClipboardMonitor::setPendingFilesMeta(
                       ", count=" + std::to_string(files.size()));
         return false;
     }
-    if (!openClipboardWithRetry(m_window, "install remote file metadata")) {
+    if (!openClipboardWithRetry(m_window, "install remote file metadata",
+                                kMetaOpenAttempts)) {
         Logger::write("clipboard: cannot open clipboard for remote file metadata");
         return false;
     }
@@ -1208,9 +1233,18 @@ LRESULT ClipboardMonitor::handleRenderFormat(UINT format) {
         const RemotePasteResult gate = m_pasteGate(metadata);
         downloaded = gate.files;
         const RemotePasteDecision decision = gate.decision;
+        if (decision == RemotePasteDecision::Wait) {
+            // The confirm window is still up; keep the delayed item alive.
+            PostMessageW(m_window, kReinstallRemoteMessage, 0, 0);
+            m_renderingFiles = false;
+            return 0;
+        }
         ready = decision == RemotePasteDecision::Ready;
         if (decision != RemotePasteDecision::Ready || downloaded.empty()) {
-            PostMessageW(m_window, kReinstallRemoteMessage, 0, 0);
+            // The task was cancelled or is gone. Drop the stale clipboard
+            // item instead of re-installing it, which would re-trigger the
+            // shell's clipboard queries on every right-click.
+            clearPendingRemoteFiles();
             m_renderingFiles = false;
             return 0;
         }
@@ -1218,7 +1252,7 @@ LRESULT ClipboardMonitor::handleRenderFormat(UINT format) {
     m_renderingFiles = false;
 
     if (!ready || downloaded.empty()) {
-        PostMessageW(m_window, kReinstallRemoteMessage, 0, 0);
+        clearPendingRemoteFiles();
         return 0;
     }
 

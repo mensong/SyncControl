@@ -76,8 +76,9 @@ public:
     void setClipboardMonitor(ClipboardMonitor* monitor) { m_clipboard = monitor; }
     void setFileTransfer(FileTransferManager* transfer) { m_fileTransfer = transfer; }
     bool isInputActive() const { return m_inputActive; }
-    // Target-side paste: asks Master for file data, waits for TCP completion.
-    std::vector<FileEntry> requestClipboardFiles(const std::atomic<bool>& cancel);
+    // Target-side paste: asks Master for file data. The TCP receive session is
+    // tracked by FileTransferManager and completed by its callback.
+    bool beginClipboardFilesRequest();
     std::vector<FileEntry> requestClipboardImage(const std::string& transferId,
                                                  const std::atomic<bool>& cancel);
     std::vector<FileEntry> requestClipboardRich(const std::string& transferId,

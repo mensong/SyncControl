@@ -717,22 +717,31 @@ void FileTransferManager::stop() {
     updateStatus(false, {}, 0, 0);
 }
 
-std::shared_ptr<std::atomic<bool>> FileTransferManager::registerActiveCancel() {
+std::shared_ptr<std::atomic<bool>> FileTransferManager::registerActiveCancel(
+    bool receive) {
     auto cancel = std::make_shared<std::atomic<bool>>(false);
     std::lock_guard<std::mutex> lock(m_cancelsMutex);
     if (!m_running.load()) {
         return nullptr;
     }
     m_activeCancels.push_back(cancel);
+    if (receive) {
+        m_receiveCancels.push_back(cancel);
+    }
     return cancel;
 }
 
 void FileTransferManager::unregisterActiveCancel(
-    const std::shared_ptr<std::atomic<bool>>& cancel) {
+    const std::shared_ptr<std::atomic<bool>>& cancel, bool receive) {
     std::lock_guard<std::mutex> lock(m_cancelsMutex);
     m_activeCancels.erase(
         std::remove(m_activeCancels.begin(), m_activeCancels.end(), cancel),
         m_activeCancels.end());
+    if (receive) {
+        m_receiveCancels.erase(
+            std::remove(m_receiveCancels.begin(), m_receiveCancels.end(), cancel),
+            m_receiveCancels.end());
+    }
 }
 
 void FileTransferManager::sendAsync(std::vector<FileEntry> files, const std::string& ip,
@@ -745,7 +754,7 @@ void FileTransferManager::sendAsync(std::vector<FileEntry> files, const std::str
     }
     Logger::write("file transfer: connecting to " + ip + ":" + std::to_string(port) +
                   ", count=" + std::to_string(files.size()));
-    auto cancel = registerActiveCancel();
+    auto cancel = registerActiveCancel(false);
     if (cancel == nullptr) {
         Logger::write("file transfer: cannot register send, manager is stopping");
         return;
@@ -761,7 +770,7 @@ void FileTransferManager::sendAsync(std::vector<FileEntry> files, const std::str
                       std::string(success ? "completed" : "failed") + " to " + ip + ":" +
                       std::to_string(port));
         updateStatus(false, {}, 0, 0);
-        unregisterActiveCancel(cancel);
+        unregisterActiveCancel(cancel, false);
     }));
 }
 
@@ -824,7 +833,7 @@ void FileTransferManager::acceptLoop() {
             continue;  // one receive session at a time; extra connects drop
         }
         const SOCKET socket = client.detach();
-        auto cancel = registerActiveCancel();
+        auto cancel = registerActiveCancel(true);
         if (cancel == nullptr) {
             Logger::write("file transfer: rejected connection, manager is stopping");
             m_sessionBusy.store(false);
@@ -832,7 +841,7 @@ void FileTransferManager::acceptLoop() {
         }
         trackWorker(std::thread([this, socket, cancel]() {
             receiveSession(socket, *cancel);
-            unregisterActiveCancel(cancel);
+            unregisterActiveCancel(cancel, true);
         }));
     }
 }
@@ -848,10 +857,20 @@ void FileTransferManager::receiveSession(SOCKET socket,
                                 updateStatus(true, progress);
                                 throttleForRemoteInput(progress.chunkBytes);
                             });
+    std::vector<FileEntry> completedFiles =
+        success ? std::move(files) : std::vector<FileEntry>{};
     {
         std::lock_guard<std::mutex> lock(m_resultMutex);
         m_lastResult.success = success;
-        m_lastResult.files = success ? std::move(files) : std::vector<FileEntry>{};
+        m_lastResult.files = completedFiles;
+    }
+    ReceiveCompletedFn handler;
+    {
+        std::lock_guard<std::mutex> lock(m_receiveCompletedHandlerMutex);
+        handler = m_receiveCompletedHandler;
+    }
+    if (handler) {
+        handler(success, std::move(completedFiles));
     }
     Logger::write(std::string("file transfer: receive ") +
                   (success ? "completed" : "failed"));
@@ -902,6 +921,22 @@ void FileTransferManager::setRemoteInputActiveHandler(
     std::function<bool()> handler) {
     std::lock_guard<std::mutex> lock(m_remoteInputActiveHandlerMutex);
     m_remoteInputActiveHandler = std::move(handler);
+}
+
+void FileTransferManager::setReceiveCompletedHandler(ReceiveCompletedFn handler) {
+    std::lock_guard<std::mutex> lock(m_receiveCompletedHandlerMutex);
+    m_receiveCompletedHandler = std::move(handler);
+}
+
+void FileTransferManager::cancelActiveReceive() {
+    std::lock_guard<std::mutex> lock(m_cancelsMutex);
+    for (const auto& cancel : m_receiveCancels) {
+        cancel->store(true);
+    }
+}
+
+bool FileTransferManager::hasReceiveSession() const {
+    return m_sessionBusy.load();
 }
 
 void FileTransferManager::throttleForRemoteInput(uint64_t bytes) {

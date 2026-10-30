@@ -362,6 +362,9 @@ Service::Service() {
     m_confirmWindow->ensureCreated();
     m_progressWindow = std::make_unique<TransferProgressWindow>();
     m_progressWindow->ensureCreated();
+    m_transferQueue->setCancelFn([this](const TransferQueue::Task& task) {
+        cancelExternalFileTransfer(task);
+    });
     m_transferQueue->start(
         [this](const TransferQueue::Task& task, const std::atomic<bool>& cancel) {
             return executeRemoteFileTransfer(task, cancel);
@@ -478,6 +481,10 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
     }
     m_fileTransfer->setProgressHandler([this](const FileTransferManager::Status& status) {
         handleTransferProgress(status);
+    });
+    m_fileTransfer->setReceiveCompletedHandler([this](bool success,
+                                                      std::vector<FileEntry> files) {
+        handleReceiveCompleted(success, std::move(files));
     });
     m_fileTransfer->setRemoteInputActiveHandler([this]() {
         if (m_role == "master") {
@@ -655,6 +662,10 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
     m_fileTransfer->setProgressHandler([this](const FileTransferManager::Status& status) {
         handleTransferProgress(status);
     });
+    m_fileTransfer->setReceiveCompletedHandler([this](bool success,
+                                                      std::vector<FileEntry> files) {
+        handleReceiveCompleted(success, std::move(files));
+    });
     m_fileTransfer->setRemoteInputActiveHandler([this]() {
         if (m_role == "master") {
             return m_master != nullptr && !m_master->focusedPeerId().empty();
@@ -707,6 +718,9 @@ void Service::applySecurityKey(const std::string& key) {
 
 void Service::stopMode() {
     Logger::write("service: mode stopped");
+    if (m_fileTransfer) {
+        m_fileTransfer->setReceiveCompletedHandler(nullptr);
+    }
     if (m_transferQueue) {
         m_transferQueue->stop();
     }
@@ -749,6 +763,10 @@ void Service::stopMode() {
     m_pendingConfirmSequence = 0;
     m_lastIgnoredOrigin.clear();
     m_lastIgnoredSequence = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_activeFileMutex);
+        m_activeFileTaskId = 0;
+    }
     m_role = "idle";
 }
 
@@ -1119,17 +1137,13 @@ void Service::handleRemoteFilesBatch(const std::string& sourceId,
         }
     }
 
-    const bool installed = m_clipboard->setPendingFilesMeta(
-        files, originPeerId, originClipboardSequence);
+    // The clipboard stays untouched until the user accepts. Installing the
+    // delayed CF_HDROP here left a stale item behind after Ignore, and
+    // Explorer re-queried it on every right-click.
     Logger::write("clipboard: remote file batch offered, task=" +
                   std::to_string(offer.taskId) + ", created=" +
-                  std::to_string(offer.created ? 1 : 0) + ", installed=" +
-                  std::to_string(installed ? 1 : 0) + ", count=" +
+                  std::to_string(offer.created ? 1 : 0) + ", count=" +
                   std::to_string(files.size()));
-    if (!installed) {
-        m_transferQueue->cancel(offer.taskId);
-        return;
-    }
 
     uint64_t totalBytes = 0;
     for (const FileEntry& entry : files) {
@@ -1367,7 +1381,7 @@ void Service::handleClipboardRichRequest(const std::string& fromPeerId,
                               m_master->peerFilePortByIp(fromPeerIp));
 }
 
-std::vector<FileEntry> Service::executeRemoteFileTransfer(
+TransferQueue::ExecuteResult Service::executeRemoteFileTransfer(
     const TransferQueue::Task& task, const std::atomic<bool>& cancel) {
     if (cancel.load()) {
         return {};
@@ -1376,10 +1390,16 @@ std::vector<FileEntry> Service::executeRemoteFileTransfer(
         const std::string transferId = task.metadata.front().name.substr(
             0, task.metadata.front().name.size() - 4);
         if (m_role == "slave" && m_slave != nullptr) {
-            return m_slave->requestClipboardImage(transferId, cancel);
+            TransferQueue::ExecuteResult result;
+            result.outcome = TransferQueue::ExecuteResult::Outcome::Completed;
+            result.files = m_slave->requestClipboardImage(transferId, cancel);
+            return result;
         }
         if (m_role == "master" && m_master != nullptr && m_fileTransfer != nullptr) {
-            return requestRemoteImageFromPeer(task.sourceId, transferId, cancel);
+            TransferQueue::ExecuteResult result;
+            result.outcome = TransferQueue::ExecuteResult::Outcome::Completed;
+            result.files = requestRemoteImageFromPeer(task.sourceId, transferId, cancel);
+            return result;
         }
     }
     if (!task.metadata.empty() && isRichTransferFile(task.metadata.front())) {
@@ -1387,20 +1407,71 @@ std::vector<FileEntry> Service::executeRemoteFileTransfer(
         const size_t dot = entry.name.find_last_of('.');
         const std::string transferId = entry.name.substr(0, dot);
         if (m_role == "slave" && m_slave != nullptr) {
-            return m_slave->requestClipboardRich(transferId, cancel);
+            TransferQueue::ExecuteResult result;
+            result.outcome = TransferQueue::ExecuteResult::Outcome::Completed;
+            result.files = m_slave->requestClipboardRich(transferId, cancel);
+            return result;
         }
         if (m_role == "master" && m_master != nullptr && m_fileTransfer != nullptr) {
-            return requestRemoteRichFromPeer(task.sourceId, transferId, cancel);
+            TransferQueue::ExecuteResult result;
+            result.outcome = TransferQueue::ExecuteResult::Outcome::Completed;
+            result.files = requestRemoteRichFromPeer(task.sourceId, transferId, cancel);
+            return result;
         }
     }
     if (m_role == "slave" && m_slave != nullptr) {
-        return m_slave->requestClipboardFiles(cancel);
+        {
+            std::lock_guard<std::mutex> lock(m_activeFileMutex);
+            m_activeFileTaskId = task.id;
+        }
+        if (!m_slave->beginClipboardFilesRequest()) {
+            std::lock_guard<std::mutex> lock(m_activeFileMutex);
+            m_activeFileTaskId = 0;
+            return {};
+        }
+        return waitForExternalFileTransfer(task.id, cancel);
     }
     if (m_role == "master" && m_master != nullptr && m_fileTransfer != nullptr) {
-        return requestRemoteFilesFromPeer(task.sourceId, cancel);
+        {
+            std::lock_guard<std::mutex> lock(m_activeFileMutex);
+            m_activeFileTaskId = task.id;
+        }
+        if (!beginRemoteFilesFromPeer(task.sourceId)) {
+            std::lock_guard<std::mutex> lock(m_activeFileMutex);
+            m_activeFileTaskId = 0;
+            return {};
+        }
+        return waitForExternalFileTransfer(task.id, cancel);
     }
     Logger::write("transfer queue: no active role for task=" +
                   std::to_string(task.id));
+    return {};
+}
+
+TransferQueue::ExecuteResult Service::waitForExternalFileTransfer(
+    uint64_t taskId, const std::atomic<bool>& cancel) {
+    const uint64_t deadline = GetTickCount64() + 30000;
+    while (!cancel.load()) {
+        if (m_fileTransfer && m_fileTransfer->hasReceiveSession()) {
+            TransferQueue::ExecuteResult result;
+            result.outcome = TransferQueue::ExecuteResult::Outcome::ExternalPending;
+            return result;
+        }
+        if (GetTickCount64() >= deadline) {
+            break;
+        }
+        Sleep(20);
+    }
+
+    Logger::write(cancel.load()
+                      ? "transfer queue: clipboard files request cancelled, task=" +
+                            std::to_string(taskId)
+                      : "transfer queue: timed out waiting for file connection, task=" +
+                            std::to_string(taskId));
+    std::lock_guard<std::mutex> lock(m_activeFileMutex);
+    if (m_activeFileTaskId == taskId) {
+        m_activeFileTaskId = 0;
+    }
     return {};
 }
 
@@ -1417,6 +1488,11 @@ void Service::handleTransferQueueEvent(const TransferQueue::Task& task) {
         case TransferQueue::State::Failed:
             Logger::write("transfer queue: remote file task failed, task=" +
                           std::to_string(task.id));
+            if (m_clipboard != nullptr) {
+                m_clipboard->postClipboardAction([this]() {
+                    m_clipboard->clearPendingRemoteFiles();
+                });
+            }
             if (m_pendingConfirmTaskId == task.id) {
                 m_pendingConfirmTaskId = 0;
                 if (m_confirmWindow) {
@@ -1427,6 +1503,11 @@ void Service::handleTransferQueueEvent(const TransferQueue::Task& task) {
         case TransferQueue::State::Cancelled:
             Logger::write("transfer queue: remote file task cancelled, task=" +
                           std::to_string(task.id));
+            if (m_clipboard != nullptr) {
+                m_clipboard->postClipboardAction([this]() {
+                    m_clipboard->clearPendingRemoteFiles();
+                });
+            }
             if (m_pendingConfirmTaskId == task.id) {
                 m_pendingConfirmTaskId = 0;
                 if (m_confirmWindow) {
@@ -1436,6 +1517,47 @@ void Service::handleTransferQueueEvent(const TransferQueue::Task& task) {
             break;
         default:
             break;
+    }
+}
+
+void Service::handleReceiveCompleted(bool success,
+                                     std::vector<FileEntry> files) {
+    uint64_t taskId = 0;
+    {
+        std::lock_guard<std::mutex> lock(m_activeFileMutex);
+        taskId = m_activeFileTaskId;
+        m_activeFileTaskId = 0;
+    }
+    if (taskId == 0) {
+        return;
+    }
+
+    // The non-blocking file path consumes the receive result directly; leaving
+    // it behind could satisfy the next image/rich-text pull request too early.
+    if (m_fileTransfer) {
+        const FileTransferManager::ReceiveResult discarded =
+            m_fileTransfer->consumeReceiveResult();
+        (void)discarded;
+    }
+
+    if (m_transferQueue == nullptr) {
+        return;
+    }
+    if (success && !files.empty()) {
+        m_transferQueue->completeExternal(taskId, std::move(files));
+    } else {
+        m_transferQueue->failExternal(taskId);
+    }
+}
+
+void Service::cancelExternalFileTransfer(const TransferQueue::Task& task) {
+    bool isActive = false;
+    {
+        std::lock_guard<std::mutex> lock(m_activeFileMutex);
+        isActive = m_activeFileTaskId == task.id;
+    }
+    if (isActive && m_fileTransfer) {
+        m_fileTransfer->cancelActiveReceive();
     }
 }
 
@@ -1533,6 +1655,11 @@ void Service::ignorePendingTransfer(uint64_t taskId) {
     if (m_transferQueue && taskId != 0) {
         m_transferQueue->cancel(taskId);
     }
+    if (m_clipboard) {
+        m_clipboard->postClipboardAction([this]() {
+            m_clipboard->clearPendingRemoteFiles();
+        });
+    }
 }
 
 void Service::handleTransferProgress(const FileTransferManager::Status& status) {
@@ -1574,31 +1701,17 @@ bool Service::isLocalPeerId(const std::string& peerId) {
     return false;
 }
 
-std::vector<FileEntry> Service::requestRemoteFilesFromPeer(
-    const std::string& peerId, const std::atomic<bool>& cancel) {
+bool Service::beginRemoteFilesFromPeer(const std::string& peerId) {
     if (m_master == nullptr || m_fileTransfer == nullptr || peerId.empty()) {
         Logger::write("master: cannot request remote files, service unavailable");
-        return {};
+        return false;
     }
 
-    const uint64_t token = m_fileTransfer->beginReceiveWait();
     if (!m_master->sendClipboardRequestTo(peerId, true)) {
         Logger::write("master: cannot request clipboard files from " + peerId);
-        return {};
+        return false;
     }
-
-    const uint64_t deadline = GetTickCount64() + 30000;
-    while (!cancel.load() && GetTickCount64() < deadline) {
-        if (m_fileTransfer->waitForReceive(token, 20)) {
-            const FileTransferManager::ReceiveResult result =
-                m_fileTransfer->consumeReceiveResult();
-            return result.success ? result.files : std::vector<FileEntry>{};
-        }
-    }
-    Logger::write(cancel.load()
-                      ? "master: clipboard files request cancelled"
-                      : "master: timed out waiting for clipboard files from " + peerId);
-    return {};
+    return true;
 }
 
 std::vector<FileEntry> Service::requestRemoteImageFromPeer(

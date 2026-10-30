@@ -24,6 +24,8 @@ namespace synccontrol {
 
 using TransferProgressFn =
     std::function<void(const struct TransferProgress& progress)>;
+using ReceiveCompletedFn =
+    std::function<void(bool, std::vector<FileEntry>)>;
 
 struct TransferProgress {
     std::string fileName;
@@ -82,6 +84,9 @@ public:
     Status status() const;
     void setProgressHandler(std::function<void(const Status&)> handler);
     void setRemoteInputActiveHandler(std::function<bool()> handler);
+    void setReceiveCompletedHandler(ReceiveCompletedFn handler);
+    void cancelActiveReceive();
+    bool hasReceiveSession() const;
 
     // Render waits: capture the completion counter, then wait for it to grow.
     uint64_t beginReceiveWait() const;
@@ -96,8 +101,9 @@ public:
 private:
     void acceptLoop();
     void receiveSession(SOCKET socket, const std::atomic<bool>& cancel);
-    std::shared_ptr<std::atomic<bool>> registerActiveCancel();
-    void unregisterActiveCancel(const std::shared_ptr<std::atomic<bool>>& cancel);
+    std::shared_ptr<std::atomic<bool>> registerActiveCancel(bool receive);
+    void unregisterActiveCancel(const std::shared_ptr<std::atomic<bool>>& cancel,
+                                bool receive);
     void updateStatus(bool active, const std::string& fileName, uint64_t transferred,
                       uint64_t total);
     void updateStatus(bool active, const TransferProgress& progress);
@@ -112,10 +118,13 @@ private:
 
     std::mutex m_cancelsMutex;
     std::vector<std::shared_ptr<std::atomic<bool>>> m_activeCancels;
+    std::vector<std::shared_ptr<std::atomic<bool>>> m_receiveCancels;
     mutable std::mutex m_statusMutex;
     Status m_status;
     std::function<void(const Status&)> m_progressHandler;
     mutable std::mutex m_progressHandlerMutex;
+    ReceiveCompletedFn m_receiveCompletedHandler;
+    mutable std::mutex m_receiveCompletedHandlerMutex;
     std::function<bool()> m_remoteInputActiveHandler;
     mutable std::mutex m_remoteInputActiveHandlerMutex;
     mutable std::mutex m_throttleMutex;

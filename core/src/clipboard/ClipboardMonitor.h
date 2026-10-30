@@ -74,6 +74,10 @@ public:
     bool setPendingFilesMeta(const std::vector<FileEntry>& files,
                              const std::string& originPeerId = {},
                              uint32_t originClipboardSequence = 0);
+    // Drops the pending remote-file clipboard item after Ignore/cancel. The
+    // clipboard is only wiped when this window still owns the unchanged
+    // content; otherwise just the pending state is cleared.
+    void clearPendingRemoteFiles();
     // Writes already-downloaded files as a real CF_HDROP list.
     bool setFilesToClipboard(const std::vector<FileEntry>& files,
                              const std::string& originPeerId = {},
