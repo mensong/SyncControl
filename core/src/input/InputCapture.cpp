@@ -360,20 +360,26 @@ LRESULT InputCapture::handleKeyboardHook(WPARAM wParam, const KBDLLHOOKSTRUCT* i
         const bool trackedAltDown = m_returnHotkeyAltDown;
         const bool asyncCtrlDown = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
         const bool asyncAltDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-        Logger::write("input: return hotkey Home keydown focus=" +
-                      std::string(m_focus == Focus::Remote ? "remote" : "local") +
-                      " trackedCtrl=" + std::to_string(trackedCtrlDown) +
-                      " trackedAlt=" + std::to_string(trackedAltDown) +
-                      " asyncCtrl=" + std::to_string(asyncCtrlDown) +
-                      " asyncAlt=" + std::to_string(asyncAltDown));
-        if ((trackedCtrlDown || asyncCtrlDown) && (trackedAltDown || asyncAltDown)) {
+        const bool hotkeyDown = (trackedCtrlDown || asyncCtrlDown) &&
+                                (trackedAltDown || asyncAltDown);
+        const bool modifierPresent = trackedCtrlDown || asyncCtrlDown ||
+                                     trackedAltDown || asyncAltDown;
+        if (modifierPresent) {
+            Logger::write("input: return hotkey Home keydown focus=" +
+                          std::string(m_focus == Focus::Remote ? "remote" : "local") +
+                          " trackedCtrl=" + std::to_string(trackedCtrlDown) +
+                          " trackedAlt=" + std::to_string(trackedAltDown) +
+                          " asyncCtrl=" + std::to_string(asyncCtrlDown) +
+                          " asyncAlt=" + std::to_string(asyncAltDown));
+        }
+        if (hotkeyDown) {
             if (m_focus == Focus::Remote) {
                 Logger::write("input: return hotkey triggered peer=" + m_focusPeerId);
                 releaseRemoteHotkeyModifiers();
                 returnToLocalCenter();
             }
+            return 1;
         }
-        return 1;
     }
 
     if (m_focus == Focus::Remote) {
