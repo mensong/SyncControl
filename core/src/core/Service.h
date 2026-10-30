@@ -81,6 +81,7 @@ private:
     void handleTransferQueueEvent(const TransferQueue::Task& task);
     void handleReceiveCompleted(bool success, std::vector<FileEntry> files);
     void cancelExternalFileTransfer(const TransferQueue::Task& task);
+    void cancelTransferFromProgress();
     ClipboardMonitor::RemotePasteResult gateRemotePaste(
         const std::vector<FileEntry>& metadata);
     void deliverCompletedTransfer(uint64_t taskId);

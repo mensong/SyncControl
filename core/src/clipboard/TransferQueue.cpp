@@ -271,6 +271,9 @@ TransferQueue::QueueStats TransferQueue::stats() const {
     std::lock_guard<std::mutex> lock(m_mutex);
     for (const Task& task : m_tasks) {
         if (task.state == State::Active) {
+            if (result.activeTaskId == 0) {
+                result.activeTaskId = task.id;
+            }
             ++result.activeCount;
         } else if (task.state == State::Queued) {
             ++result.queuedCount;

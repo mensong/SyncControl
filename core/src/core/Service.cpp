@@ -362,6 +362,9 @@ Service::Service() {
     m_confirmWindow->ensureCreated();
     m_progressWindow = std::make_unique<TransferProgressWindow>();
     m_progressWindow->ensureCreated();
+    m_progressWindow->setCancelHandler([this]() {
+        cancelTransferFromProgress();
+    });
     m_transferQueue->setCancelFn([this](const TransferQueue::Task& task) {
         cancelExternalFileTransfer(task);
     });
@@ -1551,13 +1554,22 @@ void Service::handleReceiveCompleted(bool success,
 }
 
 void Service::cancelExternalFileTransfer(const TransferQueue::Task& task) {
-    bool isActive = false;
-    {
-        std::lock_guard<std::mutex> lock(m_activeFileMutex);
-        isActive = m_activeFileTaskId == task.id;
+    (void)task;
+    if (m_fileTransfer) {
+        m_fileTransfer->cancelActiveTransfer();
     }
-    if (isActive && m_fileTransfer) {
-        m_fileTransfer->cancelActiveReceive();
+}
+
+void Service::cancelTransferFromProgress() {
+    if (m_transferQueue) {
+        const TransferQueue::QueueStats stats = m_transferQueue->stats();
+        if (stats.activeTaskId != 0) {
+            m_transferQueue->cancel(stats.activeTaskId);
+            return;
+        }
+    }
+    if (m_fileTransfer) {
+        m_fileTransfer->cancelActiveTransfer();
     }
 }
 

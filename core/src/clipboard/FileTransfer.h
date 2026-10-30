@@ -85,6 +85,7 @@ public:
     void setProgressHandler(std::function<void(const Status&)> handler);
     void setRemoteInputActiveHandler(std::function<bool()> handler);
     void setReceiveCompletedHandler(ReceiveCompletedFn handler);
+    void cancelActiveTransfer();
     void cancelActiveReceive();
     bool hasReceiveSession() const;
 

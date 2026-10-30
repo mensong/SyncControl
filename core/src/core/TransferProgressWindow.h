@@ -11,6 +11,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -42,6 +43,7 @@ public:
     TransferProgressWindow& operator=(const TransferProgressWindow&) = delete;
 
     void ensureCreated();
+    void setCancelHandler(std::function<void()> handler);
     void update(const Snapshot& snapshot);
     void hide();
 
@@ -62,12 +64,16 @@ private:
     HWND m_fileLabel = nullptr;
     HWND m_summaryLabel = nullptr;
     HWND m_progressBar = nullptr;
+    HWND m_cancelButton = nullptr;
     ATOM m_classAtom = 0;
     std::atomic<bool> m_visible{false};
     std::atomic<bool> m_running{false};
     std::atomic<bool> m_ready{false};
     std::mutex m_contentMutex;
     std::optional<Snapshot> m_pendingSnapshot;
+    std::function<void()> m_cancelHandler;
+    mutable std::mutex m_cancelHandlerMutex;
+    std::atomic<bool> m_cancelRequested{false};
     std::mutex m_stateMutex;
     std::condition_variable m_stateCv;
     std::thread m_thread;

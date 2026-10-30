@@ -928,6 +928,13 @@ void FileTransferManager::setReceiveCompletedHandler(ReceiveCompletedFn handler)
     m_receiveCompletedHandler = std::move(handler);
 }
 
+void FileTransferManager::cancelActiveTransfer() {
+    std::lock_guard<std::mutex> lock(m_cancelsMutex);
+    for (const auto& cancel : m_activeCancels) {
+        cancel->store(true);
+    }
+}
+
 void FileTransferManager::cancelActiveReceive() {
     std::lock_guard<std::mutex> lock(m_cancelsMutex);
     for (const auto& cancel : m_receiveCancels) {

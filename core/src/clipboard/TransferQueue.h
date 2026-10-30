@@ -60,6 +60,7 @@ public:
     };
 
     struct QueueStats {
+        uint64_t activeTaskId = 0;
         size_t activeCount = 0;
         size_t queuedCount = 0;
         size_t remainingCount = 0;

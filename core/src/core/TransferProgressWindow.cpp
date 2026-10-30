@@ -13,8 +13,9 @@ namespace {
 constexpr wchar_t kClassName[] = L"SyncControlTransferProgressWindow";
 constexpr UINT kUpdateMessage = WM_APP + 211;
 constexpr UINT kHideMessage = WM_APP + 212;
+constexpr UINT kCancelButtonId = 4;
 constexpr int kWindowWidth = 380;
-constexpr int kWindowHeight = 112;
+constexpr int kWindowHeight = 148;
 constexpr int kMargin = 16;
 constexpr DWORD kWindowStyle = WS_POPUP | WS_CAPTION | WS_BORDER;
 constexpr DWORD kWindowExStyle =
@@ -96,6 +97,11 @@ void TransferProgressWindow::ensureCreated() {
     m_stateCv.wait(lock, [this]() {
         return m_ready.load();
     });
+}
+
+void TransferProgressWindow::setCancelHandler(std::function<void()> handler) {
+    std::lock_guard<std::mutex> lock(m_cancelHandlerMutex);
+    m_cancelHandler = std::move(handler);
 }
 
 void TransferProgressWindow::update(const Snapshot& snapshot) {
@@ -216,8 +222,19 @@ void TransferProgressWindow::createWindow() {
                                      WS_CHILD | WS_VISIBLE,
                                      12, 60, 340, 24, m_window,
                                      reinterpret_cast<HMENU>(
-                                         static_cast<INT_PTR>(3)),
-                                     instance, nullptr);
+                                    static_cast<INT_PTR>(3)),
+                                    instance, nullptr);
+    m_cancelButton = CreateWindowExW(
+        0, L"BUTTON", L"取消",
+        WS_CHILD | WS_VISIBLE | BS_PUSHBUTTON,
+        268, 104, 100, 30, m_window,
+        reinterpret_cast<HMENU>(static_cast<INT_PTR>(kCancelButtonId)),
+        instance, nullptr);
+    if (m_cancelButton != nullptr) {
+        const WPARAM font = static_cast<WPARAM>(
+            SendMessageW(m_fileLabel, WM_GETFONT, 0, 0));
+        SendMessageW(m_cancelButton, WM_SETFONT, font, TRUE);
+    }
     SendMessageW(m_progressBar, PBM_SETRANGE32, 0, 10000);
     SendMessageW(m_progressBar, PBM_SETPOS, 0, 0);
 }
@@ -270,6 +287,12 @@ void TransferProgressWindow::updateNow(const Snapshot& snapshot) {
                    L" 个任务";
     }
     SetWindowTextW(m_summaryLabel, summary.c_str());
+
+    m_cancelRequested.store(false);
+    if (m_cancelButton != nullptr) {
+        EnableWindow(m_cancelButton, TRUE);
+        SetWindowTextW(m_cancelButton, L"取消");
+    }
 }
 
 void TransferProgressWindow::hideNow() {
@@ -303,6 +326,22 @@ LRESULT TransferProgressWindow::handleMessage(HWND window, UINT message,
         case kHideMessage:
             hideNow();
             return 0;
+        case WM_COMMAND:
+            if (LOWORD(wParam) == kCancelButtonId && HIWORD(wParam) == BN_CLICKED) {
+                std::function<void()> handler;
+                {
+                    std::lock_guard<std::mutex> lock(m_cancelHandlerMutex);
+                    handler = m_cancelHandler;
+                }
+                if (handler && !m_cancelRequested.exchange(true)) {
+                    if (m_cancelButton != nullptr) {
+                        EnableWindow(m_cancelButton, FALSE);
+                        SetWindowTextW(m_cancelButton, L"正在取消...");
+                    }
+                    handler();
+                }
+            }
+            return 0;
         case WM_MOUSEACTIVATE:
             return MA_NOACTIVATE;
         case WM_CLOSE:
@@ -313,6 +352,7 @@ LRESULT TransferProgressWindow::handleMessage(HWND window, UINT message,
             m_fileLabel = nullptr;
             m_summaryLabel = nullptr;
             m_progressBar = nullptr;
+            m_cancelButton = nullptr;
             return 0;
         default:
             break;
