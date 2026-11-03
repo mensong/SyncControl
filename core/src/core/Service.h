@@ -11,6 +11,7 @@
 
 #include "ipc/IpcServer.h"
 #include "input/InputCapture.h"
+#include "layout/EdgeSwitchPolicy.h"
 #include "clipboard/ClipboardMonitor.h"
 #include "clipboard/FileTransfer.h"
 #include "clipboard/TransferQueue.h"
@@ -45,6 +46,7 @@ private:
     bool startMasterWithLayout(const ScreenLayout& layout, const std::string& masterId,
                                const std::string& bindIp, uint16_t localPort);
     void applySecurityKey(const std::string& key);
+    void applySwitchPolicyConfig(const nlohmann::json& command);
     bool updateLayout(const nlohmann::json& layout);
     void handleClipboardSync(const std::string& fromPeerId, const std::string& toPeerId);
     void handleClipboardText(const std::string& fromPeerId, const std::string& utf8);
@@ -126,6 +128,8 @@ private:
     uint16_t m_masterLocalPort = 0;
     bool m_kcpOverride = false;
     KcpParameters m_kcpOverrideParameters;
+    EdgeSwitchPolicy::Config m_switchPolicyConfig;
+    std::mutex m_switchPolicyMutex;
     std::string m_role = "idle";
     std::string m_pendingClipboardTarget;
     std::string m_lastSentClipboardText;

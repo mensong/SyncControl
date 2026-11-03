@@ -31,6 +31,18 @@ public sealed class ServiceConfig
 
     [JsonPropertyName("autoStart")]
     public bool AutoStart { get; set; }
+
+    [JsonPropertyName("switchMode")]
+    public string SwitchMode { get; set; } = "immediate";
+
+    [JsonPropertyName("bumpWindowMs")]
+    public int BumpWindowMs { get; set; } = 1000;
+
+    [JsonPropertyName("bumpCount")]
+    public int BumpCount { get; set; } = 2;
+
+    [JsonPropertyName("dwellMs")]
+    public int DwellMs { get; set; } = 500;
 }
 
 public static class ServiceConfigStore

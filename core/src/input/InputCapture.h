@@ -16,6 +16,7 @@
 #include <string>
 
 #include "layout/EdgeRouter.h"
+#include "layout/EdgeSwitchPolicy.h"
 #include "net/Protocol.h"
 
 namespace synccontrol {
@@ -55,6 +56,7 @@ public:
 
     bool start(const Callbacks& callbacks);
     void stop();
+    void setSwitchPolicy(const EdgeSwitchPolicy::Config& config);
     HookProfile hookProfile() const { return {m_hookOverrunCount, m_hookMaxMicroseconds}; }
 
 private:
@@ -75,6 +77,15 @@ private:
     void handleRawInput(HRAWINPUT input);
 
     bool trySwitchToRemote(Edge edge, const POINT& point, float ratio);
+    // 每次鼠标移动都调用（含未贴边），维护上次位置供臂距判定。
+    // 返回 true 表示策略允许切换（此时 hit.atEdge 必为 true）。
+    bool shouldSwitchLocal(const EdgeHit& hit, const POINT& point,
+                           int screenW, int screenH);
+    bool shouldSwitchRemote(const EdgeHit& hit, int remoteW, int remoteH);
+    void startDwellTimer(Edge edge);
+    void stopDwellTimer();
+    void handleDwellTimeout();
+    static int innerDistanceFromEdge(Edge edge, int x, int y, int screenW, int screenH);
     void refreshPointerSettings();
     void moveRemote(int deltaX, int deltaY);
     void handleRemoteEdge();
@@ -134,6 +145,15 @@ private:
     int m_lastAbsoluteX = -1;
     int m_lastAbsoluteY = -1;
     uint64_t m_lastAbsoluteTickMs = 0;
+    EdgeSwitchPolicy m_switchPolicy;
+    // 策略需要光标上一次的位置做臂距判定（本地与远程各一份）。
+    int m_lastLocalX = -1;
+    int m_lastLocalY = -1;
+    double m_lastRemoteX = 0;
+    double m_lastRemoteY = 0;
+    bool m_hasLastRemote = false;
+    UINT_PTR m_dwellTimerId = 0;
+    Edge m_dwellPendingEdge = Edge::Top;
 };
 
 }  // namespace synccontrol

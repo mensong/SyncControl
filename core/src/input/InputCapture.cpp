@@ -16,6 +16,7 @@ constexpr USHORT kGenericDesktopUsagePage = 1;
 constexpr USHORT kMouseUsage = 2;
 constexpr uint64_t kAbsoluteResetMs = 200;
 constexpr int kCursorCoverAlpha = 1;
+constexpr UINT_PTR kDwellTimerId = 1;
 
 HCURSOR createTransparentCursor() {
     const int width = GetSystemMetrics(SM_CXCURSOR);
@@ -127,6 +128,7 @@ void InputCapture::stop() {
         m_focusPeerId.clear();
         showCursor();
     }
+    stopDwellTimer();
     releaseResources();
     s_instance = nullptr;
 }
@@ -243,6 +245,9 @@ LRESULT CALLBACK InputCapture::windowProc(HWND window, UINT message,
     if (s_instance != nullptr && message == WM_SETTINGCHANGE) {
         s_instance->refreshPointerSettings();
     }
+    if (s_instance != nullptr && message == WM_TIMER && wParam == kDwellTimerId) {
+        s_instance->handleDwellTimeout();
+    }
     return DefWindowProcW(window, message, wParam, lParam);
 }
 
@@ -322,7 +327,8 @@ LRESULT InputCapture::handleMouseHook(WPARAM wParam, const MSLLHOOKSTRUCT* info)
         const int screenH = GetSystemMetrics(SM_CYSCREEN);
         if (screenW > 1 && screenH > 1) {
             const EdgeHit hit = detectEdge(info->pt.x, info->pt.y, screenW, screenH);
-            if (hit.atEdge && trySwitchToRemote(hit.edge, info->pt, hit.ratio)) {
+            if (shouldSwitchLocal(hit, info->pt, screenW, screenH) &&
+                trySwitchToRemote(hit.edge, info->pt, hit.ratio)) {
                 return 1;
             }
         }
@@ -398,6 +404,112 @@ LRESULT InputCapture::handleKeyboardHook(WPARAM wParam, const KBDLLHOOKSTRUCT* i
     return CallNextHookEx(nullptr, 0, wParam, reinterpret_cast<LPARAM>(info));
 }
 
+void InputCapture::setSwitchPolicy(const EdgeSwitchPolicy::Config& config) {
+    m_switchPolicy.setConfig(config);
+    stopDwellTimer();
+    Logger::write("input: switch policy mode=" +
+                  std::to_string(static_cast<int>(config.mode)));
+}
+
+int InputCapture::innerDistanceFromEdge(Edge edge, int x, int y, int screenW,
+                                        int screenH) {
+    switch (edge) {
+        case Edge::Left: return x;
+        case Edge::Right: return screenW - 1 - x;
+        case Edge::Top: return y;
+        case Edge::Bottom: return screenH - 1 - y;
+    }
+    return screenW;
+}
+
+bool InputCapture::shouldSwitchLocal(const EdgeHit& hit, const POINT& point,
+                                     int screenW, int screenH) {
+    const uint64_t nowMs = GetTickCount64();
+    const int inner = innerDistanceFromEdge(hit.edge, point.x, point.y, screenW, screenH);
+    const int lastInner =
+        m_lastLocalX >= 0
+            ? innerDistanceFromEdge(hit.edge, m_lastLocalX, m_lastLocalY, screenW, screenH)
+            : -1;
+    const EdgeSwitchPolicy::Verdict verdict = m_switchPolicy.onMove(
+        hit.atEdge, hit.edge, hit.ratio, lastInner, nowMs);
+    if (m_switchPolicy.config().mode == EdgeSwitchPolicy::Mode::Dwell &&
+        m_switchPolicy.dwelling()) {
+        startDwellTimer(m_switchPolicy.dwellEdge());
+    } else if (m_switchPolicy.config().mode == EdgeSwitchPolicy::Mode::Dwell) {
+        stopDwellTimer();
+    }
+    m_lastLocalX = point.x;
+    m_lastLocalY = point.y;
+    return verdict == EdgeSwitchPolicy::Verdict::Switch;
+}
+
+void InputCapture::startDwellTimer(Edge edge) {
+    const uint32_t dwellMs = m_switchPolicy.config().dwellMs;
+    if (m_window == nullptr || dwellMs == 0) {
+        return;
+    }
+    if (m_dwellTimerId != 0 && m_dwellPendingEdge == edge) {
+        return;  // 已在计时同一边缘
+    }
+    if (m_dwellTimerId != 0) {
+        KillTimer(m_window, kDwellTimerId);
+    }
+    m_dwellPendingEdge = edge;
+    SetTimer(m_window, kDwellTimerId, dwellMs, nullptr);
+    m_dwellTimerId = kDwellTimerId;
+}
+
+void InputCapture::stopDwellTimer() {
+    if (m_dwellTimerId != 0 && m_window != nullptr) {
+        KillTimer(m_window, kDwellTimerId);
+    }
+    m_dwellTimerId = 0;
+    m_switchPolicy.reset();
+}
+
+void InputCapture::handleDwellTimeout() {
+    if (m_switchPolicy.config().mode != EdgeSwitchPolicy::Mode::Dwell) {
+        stopDwellTimer();
+        return;
+    }
+    if (m_focus == Focus::Local) {
+        const int screenW = GetSystemMetrics(SM_CXSCREEN);
+        const int screenH = GetSystemMetrics(SM_CYSCREEN);
+        POINT point{};
+        if (!GetCursorPos(&point) || screenW <= 1 || screenH <= 1) {
+            stopDwellTimer();
+            return;
+        }
+        const EdgeHit hit = detectEdge(point.x, point.y, screenW, screenH);
+        if (!hit.atEdge || edgeName(hit.edge) != edgeName(m_dwellPendingEdge)) {
+            stopDwellTimer();
+            return;
+        }
+        if (m_switchPolicy.onDwellTimeout(hit.edge, GetTickCount64()) ==
+                EdgeSwitchPolicy::Verdict::Switch &&
+            trySwitchToRemote(hit.edge, point, hit.ratio)) {
+            stopDwellTimer();
+        }
+        return;
+    }
+
+    // 远程焦点：用虚拟坐标复查贴边状态。
+    const int remoteX = clampToRange(
+        static_cast<int>(std::lround(m_remoteX)), m_remoteWidth - 1);
+    const int remoteY = clampToRange(
+        static_cast<int>(std::lround(m_remoteY)), m_remoteHeight - 1);
+    const EdgeHit hit = detectEdge(remoteX, remoteY, m_remoteWidth, m_remoteHeight);
+    if (!hit.atEdge || edgeName(hit.edge) != edgeName(m_dwellPendingEdge)) {
+        stopDwellTimer();
+        return;
+    }
+    if (m_switchPolicy.onDwellTimeout(hit.edge, GetTickCount64()) ==
+        EdgeSwitchPolicy::Verdict::Switch) {
+        handleRemoteEdge();
+        stopDwellTimer();
+    }
+}
+
 bool InputCapture::trySwitchToRemote(Edge edge, const POINT& point, float ratio) {
     if (!m_callbacks.localScreenId || !m_callbacks.lookupRoute) {
         return false;
@@ -446,6 +558,8 @@ bool InputCapture::trySwitchToRemote(Edge edge, const POINT& point, float ratio)
     m_remoteX = target.entryX;
     m_remoteY = target.entryY;
     m_remoteEntered = false;
+    m_switchPolicy.reset();
+    m_hasLastRemote = false;
     m_rawInputSkipCount = 1;
     m_rawInputRemoteCount = 0;
     m_rawInputMoveCount = 0;
@@ -554,8 +668,34 @@ void InputCapture::moveRemote(int deltaX, int deltaY) {
         m_remoteMoveLogged = true;
     }
     if (m_remoteEntered) {
-        handleRemoteEdge();
+        const EdgeHit hit = detectEdge(remoteX, remoteY, m_remoteWidth, m_remoteHeight);
+        if (shouldSwitchRemote(hit, m_remoteWidth, m_remoteHeight) &&
+            hit.atEdge) {
+            handleRemoteEdge();
+        }
     }
+}
+
+bool InputCapture::shouldSwitchRemote(const EdgeHit& hit, int remoteW, int remoteH) {
+    const uint64_t nowMs = GetTickCount64();
+    const int lastInner =
+        m_hasLastRemote
+            ? innerDistanceFromEdge(hit.edge, static_cast<int>(std::lround(m_lastRemoteX)),
+                                    static_cast<int>(std::lround(m_lastRemoteY)),
+                                    remoteW, remoteH)
+            : -1;
+    const EdgeSwitchPolicy::Verdict verdict =
+        m_switchPolicy.onMove(hit.atEdge, hit.edge, hit.ratio, lastInner, nowMs);
+    if (m_switchPolicy.config().mode == EdgeSwitchPolicy::Mode::Dwell &&
+        m_switchPolicy.dwelling()) {
+        startDwellTimer(m_switchPolicy.dwellEdge());
+    } else if (m_switchPolicy.config().mode == EdgeSwitchPolicy::Mode::Dwell) {
+        stopDwellTimer();
+    }
+    m_lastRemoteX = m_remoteX;
+    m_lastRemoteY = m_remoteY;
+    m_hasLastRemote = true;
+    return verdict == EdgeSwitchPolicy::Verdict::Switch;
 }
 
 void InputCapture::handleRemoteEdge() {
@@ -599,6 +739,8 @@ void InputCapture::handleRemoteEdge() {
         m_remoteY = target.entryY;
         m_remoteEntryEdge = target.toEdge;
         m_remoteEntered = false;
+        m_switchPolicy.reset();
+        m_hasLastRemote = false;
         m_rawInputSkipCount = 1;
         refreshPointerSettings();
     }
@@ -647,6 +789,8 @@ void InputCapture::returnToLocalAt(int x, int y) {
     m_remoteX = 0;
     m_remoteY = 0;
     m_remoteEntered = false;
+    stopDwellTimer();
+    m_hasLastRemote = false;
 
     const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);

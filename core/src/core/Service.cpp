@@ -167,7 +167,49 @@ struct ServiceSettings {
     uint16_t masterPort = 19881;
     uint16_t slavePort = 19881;
     std::string securityKey;
+    EdgeSwitchPolicy::Config switchPolicy;
 };
+
+bool parseSwitchPolicyMode(const std::string& name, EdgeSwitchPolicy::Mode& mode) {
+    if (name == "immediate") {
+        mode = EdgeSwitchPolicy::Mode::Immediate;
+        return true;
+    }
+    if (name == "bump") {
+        mode = EdgeSwitchPolicy::Mode::Bump;
+        return true;
+    }
+    if (name == "dwell") {
+        mode = EdgeSwitchPolicy::Mode::Dwell;
+        return true;
+    }
+    return false;
+}
+
+EdgeSwitchPolicy::Config parseSwitchPolicyConfig(const nlohmann::json& value) {
+    EdgeSwitchPolicy::Config config;
+    EdgeSwitchPolicy::Mode mode = EdgeSwitchPolicy::Mode::Immediate;
+    if (value.contains("mode") && value["mode"].is_string() &&
+        parseSwitchPolicyMode(value["mode"].get<std::string>(), mode)) {
+        config.mode = mode;
+    }
+    const auto windowIt = value.find("bumpWindowMs");
+    if (windowIt != value.end() && windowIt->is_number_integer() &&
+        windowIt->get<int>() > 0) {
+        config.bumpWindowMs = static_cast<uint32_t>(windowIt->get<int>());
+    }
+    const auto countIt = value.find("bumpCount");
+    if (countIt != value.end() && countIt->is_number_integer() &&
+        countIt->get<int>() > 0) {
+        config.bumpCount = static_cast<uint32_t>(countIt->get<int>());
+    }
+    const auto dwellIt = value.find("dwellMs");
+    if (dwellIt != value.end() && dwellIt->is_number_integer() &&
+        dwellIt->get<int>() > 0) {
+        config.dwellMs = static_cast<uint32_t>(dwellIt->get<int>());
+    }
+    return config;
+}
 
 std::string serviceConfigPath() {
     char buffer[MAX_PATH] = {};
@@ -198,6 +240,9 @@ ServiceSettings loadServiceSettings() {
         settings.masterPort = static_cast<uint16_t>(value.value("masterPort", 19881));
         settings.slavePort = static_cast<uint16_t>(value.value("slavePort", 19881));
         settings.securityKey = value.value("securityKey", std::string());
+        if (value.contains("switchMode") && value["switchMode"].is_string()) {
+            settings.switchPolicy = parseSwitchPolicyConfig(value);
+        }
     } catch (const std::exception&) {
         Logger::write("service: invalid service-config.json, using defaults");
     }
@@ -422,6 +467,10 @@ bool Service::startMaster(const nlohmann::json& layoutJson, const std::string& b
 bool Service::startSavedMaster() {
     const ServiceSettings settings = loadServiceSettings();
     applySecurityKey(settings.securityKey);
+    {
+        std::lock_guard<std::mutex> lock(m_switchPolicyMutex);
+        m_switchPolicyConfig = settings.switchPolicy;
+    }
     ScreenLayout layout;
     if (!layout.loadFromFile(savedMasterLayoutPath())) {
         Logger::write("master: no valid saved layout to restore");
@@ -438,6 +487,10 @@ bool Service::startSavedMaster() {
 bool Service::startSavedSlave() {
     const ServiceSettings settings = loadServiceSettings();
     applySecurityKey(settings.securityKey);
+    {
+        std::lock_guard<std::mutex> lock(m_switchPolicyMutex);
+        m_switchPolicyConfig = settings.switchPolicy;
+    }
     return startSlave(settings.slavePort, settings.masterIp, settings.masterPort);
 }
 
@@ -603,6 +656,10 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
         m_role = "idle";
         return false;
     }
+    {
+        std::lock_guard<std::mutex> policyLock(m_switchPolicyMutex);
+        m_inputCapture->setSwitchPolicy(m_switchPolicyConfig);
+    }
 
     if (!m_clipboard) {
         m_clipboard = std::make_unique<ClipboardMonitor>();
@@ -716,6 +773,17 @@ void Service::applySecurityKey(const std::string& key) {
                                 : SecurityKeyStore::importKey(key);
     if (!ok) {
         Logger::write("service: failed to apply security key settings");
+    }
+}
+
+void Service::applySwitchPolicyConfig(const nlohmann::json& command) {
+    const EdgeSwitchPolicy::Config config = parseSwitchPolicyConfig(command);
+    {
+        std::lock_guard<std::mutex> lock(m_switchPolicyMutex);
+        m_switchPolicyConfig = config;
+    }
+    if (m_inputCapture) {
+        m_inputCapture->setSwitchPolicy(config);
     }
 }
 
@@ -1963,7 +2031,7 @@ nlohmann::json Service::handleIpc(const nlohmann::json& command) {
         return {{"type", "ok"}, {"accepted", type}};
     }
     if (type == "start_master" || type == "start_slave" || type == "stop" ||
-        type == "update_layout" || type == "exit") {
+        type == "update_layout" || type == "set_switch_policy" || type == "exit") {
         {
             std::lock_guard<std::mutex> lock(m_commandMutex);
             m_ipcCommands.push(command);
@@ -2106,6 +2174,10 @@ void Service::processIpcCommands() {
                 applySecurityKey(command.value("securityKey", std::string()));
                 startMaster(ip, static_cast<uint16_t>(command.value("port", 19881)));
             }
+            const auto policyIt = command.find("switchPolicy");
+            if (policyIt != command.end() && policyIt->is_object()) {
+                applySwitchPolicyConfig(*policyIt);
+            }
         } else if (type == "start_slave") {
             applySecurityKey(command.value("securityKey", std::string()));
             startSlave(static_cast<uint16_t>(command.value("localPort", 19881)),
@@ -2123,6 +2195,8 @@ void Service::processIpcCommands() {
             } else if (!updateLayout(*layoutIt)) {
                 std::cerr << "update_layout: rejected\n";
             }
+        } else if (type == "set_switch_policy") {
+            applySwitchPolicyConfig(command);
         } else if (type == "reauthenticate") {
             reauthenticatePeers();
         }

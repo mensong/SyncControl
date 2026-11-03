@@ -17,6 +17,7 @@ add_executable(SyncControlCore
     src/clipboard/TransferQueue.cpp
     src/layout/ScreenLayout.cpp
     src/layout/EdgeRouter.cpp
+    src/layout/EdgeSwitchPolicy.cpp
     src/net/Protocol.cpp
     src/net/UdpSocket.cpp
     src/net/KcpReliable.cpp

@@ -149,6 +149,28 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private int _kcpReceiveWindow = 128;
 
+    [ObservableProperty]
+    private string _switchMode = "immediate";
+
+    [ObservableProperty]
+    private int _bumpWindowMs = 1000;
+
+    [ObservableProperty]
+    private int _bumpCount = 2;
+
+    [ObservableProperty]
+    private int _dwellMs = 500;
+
+    partial void OnSwitchModeChanged(string value)
+    {
+        OnPropertyChanged(nameof(IsBumpMode));
+        OnPropertyChanged(nameof(IsDwellMode));
+    }
+
+    public bool IsBumpMode => SwitchMode == "bump";
+
+    public bool IsDwellMode => SwitchMode == "dwell";
+
     public event Action<string>? PeerConnected;
 
     public event Action<string>? PeerDisconnected;
@@ -455,6 +477,12 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         MasterPort = config.MasterPort > 0 ? config.MasterPort : 19881;
         SlavePort = config.SlavePort > 0 ? config.SlavePort : 19881;
         SecurityKey = config.SecurityKey;
+        SwitchMode = config.SwitchMode is "immediate" or "bump" or "dwell"
+            ? config.SwitchMode
+            : "immediate";
+        BumpWindowMs = config.BumpWindowMs > 0 ? config.BumpWindowMs : 1000;
+        BumpCount = config.BumpCount > 0 ? config.BumpCount : 2;
+        DwellMs = config.DwellMs > 0 ? config.DwellMs : 500;
         AutostartEnabled = AutostartManager.IsEnabled(slaveMode: SelectedRole == "slave");
     }
 
@@ -470,6 +498,10 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             SlavePort = SlavePort,
             SecurityKey = SecurityKey,
             AutoStart = AutostartEnabled,
+            SwitchMode = SwitchMode,
+            BumpWindowMs = BumpWindowMs,
+            BumpCount = BumpCount,
+            DwellMs = DwellMs,
         });
         if (AutostartEnabled)
         {
@@ -875,6 +907,27 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         });
         StatusText = response.Success ? "KCP 参数已应用" : "KCP 参数无效";
         FileLogger.Info($"manual KCP parameters {(response.Success ? "accepted" : "rejected")}");
+    }
+
+    [RelayCommand]
+    private async Task ApplySwitchPolicyAsync()
+    {
+        PersistServiceConfig();
+        var response = await _ipc.SendAsync(BuildSwitchPolicyCommand());
+        StatusText = response.Success ? "切换策略已应用" : "切换策略无效";
+        FileLogger.Info($"switch policy {(response.Success ? "accepted" : "rejected")}: {SwitchMode}");
+    }
+
+    private JsonObject BuildSwitchPolicyCommand()
+    {
+        return new JsonObject
+        {
+            ["type"] = "set_switch_policy",
+            ["mode"] = SwitchMode,
+            ["bumpWindowMs"] = BumpWindowMs,
+            ["bumpCount"] = BumpCount,
+            ["dwellMs"] = DwellMs,
+        };
     }
 
     private static string KcpFlagText(JsonNode? value)
