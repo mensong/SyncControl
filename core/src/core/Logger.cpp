@@ -10,6 +10,9 @@ namespace {
 
 constexpr long long kMaxLogBytes = 10LL * 1024 * 1024;
 
+// Set once by the --helper entry point; see Logger::setHelperMode.
+BOOL g_helperMode = FALSE;
+
 std::wstring logDirectory() {
     char buffer[MAX_PATH]{};
     UINT size = GetEnvironmentVariableA("LOCALAPPDATA", buffer, MAX_PATH);
@@ -28,6 +31,15 @@ std::wstring logDirectory() {
     return directory;
 }
 
+// The session helper runs as SYSTEM in the user's session; its LOCALAPPDATA
+// points at the system profile where nobody looks. Helpers log to ProgramData
+// so helper diagnostics stay visible to the user.
+std::wstring helperLogDirectory() {
+    const std::wstring directory = L"C:\\ProgramData\\SyncControl";
+    CreateDirectoryW(directory.c_str(), nullptr);
+    return directory;
+}
+
 void writeLocked(const std::wstring& path, const std::string& line) {
     HANDLE file = CreateFileW(path.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ, nullptr,
                               OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -39,28 +51,14 @@ void writeLocked(const std::wstring& path, const std::string& line) {
     CloseHandle(file);
 }
 
-}  // namespace
-
-void Logger::write(const std::string& message) {
-    static std::mutex mutex;
-    std::lock_guard<std::mutex> lock(mutex);
-
-    SYSTEMTIME time{};
-    GetLocalTime(&time);
-    char stamp[40]{};
-    std::snprintf(stamp, sizeof(stamp), "[%02u-%02u %02u:%02u:%02u.%03u] ",
-                  time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
-                  time.wMilliseconds);
-    const std::string line = stamp + message + "\n";
-    OutputDebugStringA(line.c_str());
-
-    const std::wstring directory = logDirectory();
+void writeTo(const std::wstring& directory, const std::string& line) {
     if (directory.empty()) {
         return;
     }
     const std::wstring path = directory + L"\\core.log";
-    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                              nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    HANDLE file = CreateFileW(path.c_str(), GENERIC_READ,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                              OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (file != INVALID_HANDLE_VALUE) {
         LARGE_INTEGER size{};
         if (GetFileSizeEx(file, &size) && size.QuadPart > kMaxLogBytes) {
@@ -76,6 +74,36 @@ void Logger::write(const std::string& message) {
         CloseHandle(file);
     }
     writeLocked(path, line);
+}
+
+}  // namespace
+
+void Logger::setHelperMode() {
+    g_helperMode = TRUE;
+}
+
+bool Logger::isHelperMode() {
+    return g_helperMode != FALSE;
+}
+
+void Logger::write(const std::string& message) {
+    static std::mutex mutex;
+    std::lock_guard<std::mutex> lock(mutex);
+
+    SYSTEMTIME time{};
+    GetLocalTime(&time);
+    char stamp[40]{};
+    std::snprintf(stamp, sizeof(stamp), "[%02u-%02u %02u:%02u:%02u.%03u] ",
+                  time.wMonth, time.wDay, time.wHour, time.wMinute, time.wSecond,
+                  time.wMilliseconds);
+    const std::string line = stamp + message + "\n";
+    OutputDebugStringA(line.c_str());
+
+    if (g_helperMode != FALSE) {
+        writeTo(helperLogDirectory(), line);
+        return;
+    }
+    writeTo(logDirectory(), line);
 }
 
 }  // namespace synccontrol

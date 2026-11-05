@@ -9,6 +9,7 @@
 
 #include "core/Logger.h"
 #include "core/Security.h"
+#include "helper/HelperServiceControl.h"
 
 namespace synccontrol {
 namespace {
@@ -386,6 +387,8 @@ bool saveClipboardRichFile(const std::string& transferId,
 
 Service::Service() {
     FileTransferManager::cleanupTempSessions();
+    s_activeInstance = this;
+    m_secureDesktopMonitor.start(&Service::onSecureDesktopChangedStatic);
     m_ipc = std::make_unique<IpcServer>([this](const nlohmann::json& command) {
         return handleIpc(command);
     });
@@ -423,6 +426,8 @@ Service::Service() {
 }
 
 Service::~Service() {
+    m_secureDesktopMonitor.stop();
+    s_activeInstance = nullptr;
     stopMode();
     if (m_fileTransfer) {
         m_fileTransfer->setProgressHandler(nullptr);
@@ -757,6 +762,13 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
                                         masterIp, masterPort != 0 ? masterPort : 19881);
     if (started) {
         m_role = "slave";
+        // Slave mode injects input, so the UAC helper service must be in
+        // place. Install+start is idempotent; failure only means UAC prompts
+        // fall back to local inject, which the log records.
+        std::string helperError;
+        if (!HelperServiceControl::isInstalled() && !HelperServiceControl::install(helperError)) {
+            Logger::write("slave: helper service auto-install failed: " + helperError);
+        }
         Logger::write("slave: started on port " + std::to_string(localPort) +
                       ", master " + masterIp + ":" + std::to_string(masterPort));
     } else {
@@ -785,6 +797,16 @@ void Service::applySwitchPolicyConfig(const nlohmann::json& command) {
     if (m_inputCapture) {
         m_inputCapture->setSwitchPolicy(config);
     }
+}
+
+void Service::onSecureDesktopChanged(bool secure) {
+    if (m_inputCapture) {
+        m_inputCapture->setSecureDesktop(secure);
+    }
+}
+
+void Service::onSecureDesktopChangedStatic(bool secure) {
+    s_activeInstance->onSecureDesktopChanged(secure);
 }
 
 void Service::stopMode() {
@@ -2030,6 +2052,19 @@ nlohmann::json Service::handleIpc(const nlohmann::json& command) {
         Logger::write("service: manual KCP parameters applied");
         return {{"type", "ok"}, {"accepted", type}};
     }
+    if (type == "install_helper_service" || type == "uninstall_helper_service") {
+        std::string error;
+        const bool install = type == "install_helper_service";
+        const bool ok = install ? HelperServiceControl::install(error)
+                                : HelperServiceControl::uninstall(error);
+        Logger::write(std::string("service: helper service ") +
+                      (install ? "install" : "uninstall") +
+                      (ok ? " succeeded" : " failed: " + error));
+        if (!ok) {
+            return {{"type", "error"}, {"message", error}};
+        }
+        return {{"type", "ok"}, {"accepted", type}};
+    }
     if (type == "start_master" || type == "start_slave" || type == "stop" ||
         type == "update_layout" || type == "set_switch_policy" || type == "exit") {
         {
@@ -2120,6 +2155,8 @@ nlohmann::json Service::getStatusLocked() {
         // the configured empty-key mode would break on the next GUI refresh.
         {"keyConfigured", !SecurityKeyStore::load().empty()},
     };
+    status["helper"] = {{"serviceInstalled", HelperServiceControl::isInstalled()},
+                        {"serviceRunning", HelperServiceControl::isRunning()}};
 
     std::string clipboardState = "empty";
     if (m_clipboard) {

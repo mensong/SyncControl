@@ -12,6 +12,11 @@ add_executable(SyncControlCore
     src/main.cpp
     src/input/InputCapture.cpp
     src/input/InputInject.cpp
+    src/input/SecureDesktopMonitor.cpp
+    src/helper/HelperInjector.cpp
+    src/helper/HelperServiceControl.cpp
+    src/helper/HelperInjectorClient.cpp
+    src/helper/SessionHelperLauncher.cpp
     src/clipboard/ClipboardMonitor.cpp
     src/clipboard/FileTransfer.cpp
     src/clipboard/TransferQueue.cpp
@@ -56,4 +61,4 @@ if(MSVC)
         "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup" "/MANIFESTUAC:NO")
 endif()
 
-target_link_libraries(SyncControlCore PRIVATE ws2_32 user32 shell32 bcrypt advapi32 comctl32 gdiplus)
+target_link_libraries(SyncControlCore PRIVATE ws2_32 user32 shell32 bcrypt advapi32 comctl32 gdiplus wtsapi32)

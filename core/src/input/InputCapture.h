@@ -58,6 +58,9 @@ public:
     void stop();
     void setSwitchPolicy(const EdgeSwitchPolicy::Config& config);
     HookProfile hookProfile() const { return {m_hookOverrunCount, m_hookMaxMicroseconds}; }
+    // Called on secure-desktop transitions. While the UAC/lock desktop is
+    // active the hooks cannot see input, so remote focus must be released.
+    void setSecureDesktop(bool secure);
 
 private:
     enum class Focus {
@@ -154,6 +157,7 @@ private:
     bool m_hasLastRemote = false;
     UINT_PTR m_dwellTimerId = 0;
     Edge m_dwellPendingEdge = Edge::Top;
+    bool m_secureDesktop = false;
 };
 
 }  // namespace synccontrol

@@ -411,6 +411,16 @@ void InputCapture::setSwitchPolicy(const EdgeSwitchPolicy::Config& config) {
                   std::to_string(static_cast<int>(config.mode)));
 }
 
+void InputCapture::setSecureDesktop(bool secure) {
+    m_secureDesktop = secure;
+    if (secure && m_focus == Focus::Remote) {
+        Logger::write("input: releasing remote focus for secure desktop, peer=" +
+                      m_focusPeerId);
+        releaseRemoteHotkeyModifiers();
+        returnToLocalCenter();
+    }
+}
+
 int InputCapture::innerDistanceFromEdge(Edge edge, int x, int y, int screenW,
                                         int screenH) {
     switch (edge) {

@@ -19,7 +19,7 @@
 
 #include "clipboard/ClipboardMonitor.h"
 #include "clipboard/FileTransfer.h"
-#include "input/InputInject.h"
+#include "helper/HelperInjectorClient.h"
 #include "net/KcpReliable.h"
 #include "net/Protocol.h"
 #include "net/UdpSocket.h"
@@ -110,7 +110,9 @@ private:
     UdpSocket m_socket;
     std::vector<Peer> m_peers;
     mutable std::recursive_mutex m_networkMutex;
-    InputInject m_input;
+    // Injection first forwards to the SYSTEM session helper (reaches the
+    // secure desktop); the base InputInject is the local fallback.
+    HelperInjectorClient m_input;
     ClipboardMonitor* m_clipboard = nullptr;
     std::function<void(const std::string& originPeerId,
                        uint32_t originClipboardSequence,

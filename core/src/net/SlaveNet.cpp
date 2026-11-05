@@ -118,6 +118,10 @@ bool SlaveNet::start(uint16_t localPort, const std::string& masterIp, uint16_t m
     m_masterPort = masterPort;
     m_masterEndpoint.sin_family = AF_INET;
     m_masterEndpoint.sin_port = htons(masterPort);
+    // The helper connection must start on every path: injection works
+    // independently of master reachability (and of whether masterIp is a
+    // resolvable address at all).
+    m_input.startHelperConnection();
     if (InetPtonA(AF_INET, masterIp.c_str(), &m_masterEndpoint.sin_addr) != 1) {
         Logger::write("slave: invalid master IP " + masterIp);
         m_masterEndpoint = {};
@@ -171,6 +175,7 @@ void SlaveNet::stop() {
     m_clipboardImages.clear();
     m_clipboardRich.clear();
     m_socket.close();
+    m_input.stopHelperConnection();
 }
 
 std::string nextClipboardImageId() {

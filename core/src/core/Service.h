@@ -11,6 +11,7 @@
 
 #include "ipc/IpcServer.h"
 #include "input/InputCapture.h"
+#include "input/SecureDesktopMonitor.h"
 #include "layout/EdgeSwitchPolicy.h"
 #include "clipboard/ClipboardMonitor.h"
 #include "clipboard/FileTransfer.h"
@@ -27,6 +28,9 @@ class Service {
 public:
     Service();
     ~Service();
+
+    // Static hook so the C-style monitor callback can find the live instance.
+    inline static Service* s_activeInstance = nullptr;
 
     bool startMaster(const std::string& ip, uint16_t localPort);
     bool startMaster(const nlohmann::json& layout, const std::string& bindIp,
@@ -101,11 +105,14 @@ private:
     bool resolveMasterScreen(const ScreenLayout& layout, std::string& masterId) const;
     InputCapture::RouteTarget lookupRouteForCapture(const std::string& screenId,
                                                     Edge edge, float ratio);
+    static void onSecureDesktopChangedStatic(bool secure);
+    void onSecureDesktopChanged(bool secure);
 
     std::unique_ptr<MasterNet> m_master;
     std::unique_ptr<SlaveNet> m_slave;
     std::unique_ptr<IpcServer> m_ipc;
     std::unique_ptr<InputCapture> m_inputCapture;
+    SecureDesktopMonitor m_secureDesktopMonitor;
     std::unique_ptr<ClipboardMonitor> m_clipboard;
     std::unique_ptr<FileTransferManager> m_fileTransfer;
     std::unique_ptr<TransferQueue> m_transferQueue;

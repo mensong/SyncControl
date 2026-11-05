@@ -129,6 +129,12 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private string _mouseLossText = "鼠标丢包率：--";
 
     [ObservableProperty]
+    private bool _helperServiceInstalled;
+
+    [ObservableProperty]
+    private bool _helperServiceBusy;
+
+    [ObservableProperty]
     private bool _manualKcp;
 
     [ObservableProperty]
@@ -510,6 +516,39 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         }
     }
 
+    [RelayCommand]
+    private async Task ToggleHelperServiceAsync()
+    {
+        if (HelperServiceBusy)
+        {
+            return;
+        }
+        HelperServiceBusy = true;
+        try
+        {
+            var type = HelperServiceInstalled ? "uninstall_helper_service" : "install_helper_service";
+            var response = await _ipc.SendAsync(new JsonObject { ["type"] = type });
+            if (response.Success && response.Response?["type"]?.GetValue<string>() == "ok")
+            {
+                HelperServiceInstalled = !HelperServiceInstalled;
+                StatusText = HelperServiceInstalled
+                    ? "UAC 控制服务已安装"
+                    : "UAC 控制服务已卸载";
+                FileLogger.Info($"helper service {type} ok");
+            }
+            else
+            {
+                var message = response.Response?["message"]?.GetValue<string>() ?? "未知错误";
+                StatusText = $"UAC 控制服务操作失败: {message}";
+                FileLogger.Error($"helper service {type} failed: {message}");
+            }
+        }
+        finally
+        {
+            HelperServiceBusy = false;
+        }
+    }
+
     private void ResetServiceState()
     {
         IsRunning = false;
@@ -801,6 +840,8 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             StatusText = $"{unconfiguredIp}已上线，请进行布局配置";
         }
         UpdateNetworkStatus(status["network"] as JsonObject);
+        HelperServiceInstalled = status["helper"]?["serviceInstalled"]?.GetValue<bool>()
+                                 ?? HelperServiceInstalled;
     }
 
     private void EnsureLayoutNode(string peerId, string peerIp)

@@ -56,8 +56,7 @@ DWORD buttonUpFlag(MouseButtonCode button) {
 
 }  // namespace
 
-bool InputInject::mouseMove(uint16_t x, uint16_t y) const {
-    const int screenW = GetSystemMetrics(SM_CXSCREEN);
+bool InputInject::mouseMove(uint16_t x, uint16_t y) const {    const int screenW = GetSystemMetrics(SM_CXSCREEN);
     const int screenH = GetSystemMetrics(SM_CYSCREEN);
     INPUT input{};
     input.type = INPUT_MOUSE;
