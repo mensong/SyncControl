@@ -923,7 +923,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         return new JsonObject
         {
             ["type"] = "set_switch_policy",
-            ["mode"] = SwitchMode,
+            ["switchMode"] = SwitchMode,
             ["bumpWindowMs"] = BumpWindowMs,
             ["bumpCount"] = BumpCount,
             ["dwellMs"] = DwellMs,

@@ -189,8 +189,8 @@ bool parseSwitchPolicyMode(const std::string& name, EdgeSwitchPolicy::Mode& mode
 EdgeSwitchPolicy::Config parseSwitchPolicyConfig(const nlohmann::json& value) {
     EdgeSwitchPolicy::Config config;
     EdgeSwitchPolicy::Mode mode = EdgeSwitchPolicy::Mode::Immediate;
-    if (value.contains("mode") && value["mode"].is_string() &&
-        parseSwitchPolicyMode(value["mode"].get<std::string>(), mode)) {
+    if (value.contains("switchMode") && value["switchMode"].is_string() &&
+        parseSwitchPolicyMode(value["switchMode"].get<std::string>(), mode)) {
         config.mode = mode;
     }
     const auto windowIt = value.find("bumpWindowMs");
@@ -2173,10 +2173,6 @@ void Service::processIpcCommands() {
                 const std::string ip = command.value("ip", m_masterIp);
                 applySecurityKey(command.value("securityKey", std::string()));
                 startMaster(ip, static_cast<uint16_t>(command.value("port", 19881)));
-            }
-            const auto policyIt = command.find("switchPolicy");
-            if (policyIt != command.end() && policyIt->is_object()) {
-                applySwitchPolicyConfig(*policyIt);
             }
         } else if (type == "start_slave") {
             applySecurityKey(command.value("securityKey", std::string()));
