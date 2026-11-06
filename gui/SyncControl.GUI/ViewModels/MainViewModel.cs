@@ -167,6 +167,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     [ObservableProperty]
     private int _dwellMs = 500;
 
+    [ObservableProperty]
+    private int _clipboardConfirmThresholdMb = 10;
+
     partial void OnSwitchModeChanged(string value)
     {
         OnPropertyChanged(nameof(IsBumpMode));
@@ -489,6 +492,9 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         BumpWindowMs = config.BumpWindowMs > 0 ? config.BumpWindowMs : 1000;
         BumpCount = config.BumpCount > 0 ? config.BumpCount : 2;
         DwellMs = config.DwellMs > 0 ? config.DwellMs : 500;
+        ClipboardConfirmThresholdMb = config.ClipboardConfirmThresholdMb >= 0
+            ? config.ClipboardConfirmThresholdMb
+            : 10;
         AutostartEnabled = AutostartManager.IsEnabled(slaveMode: SelectedRole == "slave");
     }
 
@@ -508,6 +514,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             BumpWindowMs = BumpWindowMs,
             BumpCount = BumpCount,
             DwellMs = DwellMs,
+            ClipboardConfirmThresholdMb = ClipboardConfirmThresholdMb,
         });
         if (AutostartEnabled)
         {
@@ -969,6 +976,20 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             ["bumpCount"] = BumpCount,
             ["dwellMs"] = DwellMs,
         };
+    }
+
+    [RelayCommand]
+    private async Task ApplyClipboardConfirmThresholdAsync()
+    {
+        PersistServiceConfig();
+        var thresholdMb = Math.Max(0, ClipboardConfirmThresholdMb);
+        var response = await _ipc.SendAsync(new JsonObject
+        {
+            ["type"] = "set_clipboard_confirm_threshold",
+            ["clipboardConfirmThresholdBytes"] = (long)thresholdMb * 1024 * 1024,
+        });
+        StatusText = response.Success ? "剪贴板同步设置已应用" : "剪贴板同步设置无效";
+        FileLogger.Info($"clipboard confirm threshold {(response.Success ? "accepted" : "rejected")}: {thresholdMb} MB");
     }
 
     private static string KcpFlagText(JsonNode? value)

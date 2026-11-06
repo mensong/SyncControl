@@ -160,6 +160,10 @@ void persistMasterLayout(const ScreenLayout& layout) {
     }
 }
 
+// Rich-content transfers below this size skip the confirm window; 0 means
+// always ask.
+constexpr uint64_t kClipboardConfirmThresholdBytes = 10 * 1024 * 1024;
+
 struct ServiceSettings {
     std::string role = "master";
     std::string bindIp = "0.0.0.0";
@@ -169,7 +173,16 @@ struct ServiceSettings {
     uint16_t slavePort = 19881;
     std::string securityKey;
     EdgeSwitchPolicy::Config switchPolicy;
+    uint64_t clipboardConfirmThresholdBytes = kClipboardConfirmThresholdBytes;
 };
+
+uint64_t parseClipboardConfirmThreshold(const nlohmann::json& value) {
+    const auto it = value.find("clipboardConfirmThresholdBytes");
+    if (it == value.end() || !it->is_number_unsigned()) {
+        return kClipboardConfirmThresholdBytes;
+    }
+    return it->get<uint64_t>();
+}
 
 bool parseSwitchPolicyMode(const std::string& name, EdgeSwitchPolicy::Mode& mode) {
     if (name == "immediate") {
@@ -241,6 +254,8 @@ ServiceSettings loadServiceSettings() {
         settings.masterPort = static_cast<uint16_t>(value.value("masterPort", 19881));
         settings.slavePort = static_cast<uint16_t>(value.value("slavePort", 19881));
         settings.securityKey = value.value("securityKey", std::string());
+        settings.clipboardConfirmThresholdBytes =
+            parseClipboardConfirmThreshold(value);
         if (value.contains("switchMode") && value["switchMode"].is_string()) {
             settings.switchPolicy = parseSwitchPolicyConfig(value);
         }
@@ -472,6 +487,8 @@ bool Service::startMaster(const nlohmann::json& layoutJson, const std::string& b
 bool Service::startSavedMaster() {
     const ServiceSettings settings = loadServiceSettings();
     applySecurityKey(settings.securityKey);
+    m_clipboardConfirmThresholdBytes.store(
+        settings.clipboardConfirmThresholdBytes, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(m_switchPolicyMutex);
         m_switchPolicyConfig = settings.switchPolicy;
@@ -492,6 +509,8 @@ bool Service::startSavedMaster() {
 bool Service::startSavedSlave() {
     const ServiceSettings settings = loadServiceSettings();
     applySecurityKey(settings.securityKey);
+    m_clipboardConfirmThresholdBytes.store(
+        settings.clipboardConfirmThresholdBytes, std::memory_order_relaxed);
     {
         std::lock_guard<std::mutex> lock(m_switchPolicyMutex);
         m_switchPolicyConfig = settings.switchPolicy;
@@ -797,6 +816,18 @@ void Service::applySwitchPolicyConfig(const nlohmann::json& command) {
     if (m_inputCapture) {
         m_inputCapture->setSwitchPolicy(config);
     }
+}
+
+void Service::applyClipboardConfirmThreshold(const nlohmann::json& command) {
+    const uint64_t threshold = parseClipboardConfirmThreshold(command);
+    m_clipboardConfirmThresholdBytes.store(threshold,
+                                           std::memory_order_relaxed);
+    Logger::write("service: clipboard confirm threshold set to " +
+                  std::to_string(threshold) + " bytes");
+}
+
+uint64_t Service::clipboardConfirmThresholdBytes() const {
+    return m_clipboardConfirmThresholdBytes.load(std::memory_order_relaxed);
 }
 
 void Service::onSecureDesktopChanged(bool secure) {
@@ -1245,6 +1276,15 @@ void Service::handleRemoteFilesBatch(const std::string& sourceId,
         }
     }
     if (offer.created) {
+        const uint64_t threshold = clipboardConfirmThresholdBytes();
+        if (threshold > 0 && totalBytes <= threshold) {
+            // Small transfers skip the confirm window entirely.
+            Logger::write("clipboard: remote file batch auto-confirmed, task=" +
+                          std::to_string(offer.taskId) + ", bytes=" +
+                          std::to_string(totalBytes));
+            m_transferQueue->confirm(offer.taskId);
+            return;
+        }
         m_pendingConfirmTaskId = offer.taskId;
         m_pendingConfirmOrigin = originPeerId;
         m_pendingConfirmSequence = originClipboardSequence;
@@ -1371,6 +1411,15 @@ void Service::handleRemoteRichBatch(const std::string& sourceId,
                   ", transferId=" + meta.transferId +
                   ", bytes=" + std::to_string(meta.richBytes));
     if (offer.created) {
+        const uint64_t threshold = clipboardConfirmThresholdBytes();
+        if (threshold > 0 && meta.richBytes <= threshold) {
+            // Small transfers skip the confirm window entirely.
+            Logger::write("clipboard: remote rich content auto-confirmed, task=" +
+                          std::to_string(offer.taskId) + ", bytes=" +
+                          std::to_string(meta.richBytes));
+            m_transferQueue->confirm(offer.taskId);
+            return;
+        }
         m_pendingConfirmTaskId = offer.taskId;
         m_pendingConfirmOrigin = meta.originPeerId;
         m_pendingConfirmSequence = meta.originClipboardSequence;
@@ -2066,7 +2115,8 @@ nlohmann::json Service::handleIpc(const nlohmann::json& command) {
         return {{"type", "ok"}, {"accepted", type}};
     }
     if (type == "start_master" || type == "start_slave" || type == "stop" ||
-        type == "update_layout" || type == "set_switch_policy" || type == "exit") {
+        type == "update_layout" || type == "set_switch_policy" ||
+        type == "set_clipboard_confirm_threshold" || type == "exit") {
         {
             std::lock_guard<std::mutex> lock(m_commandMutex);
             m_ipcCommands.push(command);
@@ -2230,6 +2280,8 @@ void Service::processIpcCommands() {
             }
         } else if (type == "set_switch_policy") {
             applySwitchPolicyConfig(command);
+        } else if (type == "set_clipboard_confirm_threshold") {
+            applyClipboardConfirmThreshold(command);
         } else if (type == "reauthenticate") {
             reauthenticatePeers();
         }

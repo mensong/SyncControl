@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <cstdint>
 #include <memory>
 #include <mutex>
@@ -51,6 +52,8 @@ private:
                                const std::string& bindIp, uint16_t localPort);
     void applySecurityKey(const std::string& key);
     void applySwitchPolicyConfig(const nlohmann::json& command);
+    void applyClipboardConfirmThreshold(const nlohmann::json& command);
+    uint64_t clipboardConfirmThresholdBytes() const;
     bool updateLayout(const nlohmann::json& layout);
     void handleClipboardSync(const std::string& fromPeerId, const std::string& toPeerId);
     void handleClipboardText(const std::string& fromPeerId, const std::string& utf8);
@@ -137,6 +140,8 @@ private:
     KcpParameters m_kcpOverrideParameters;
     EdgeSwitchPolicy::Config m_switchPolicyConfig;
     std::mutex m_switchPolicyMutex;
+    std::atomic<uint64_t> m_clipboardConfirmThresholdBytes{
+        10 * 1024 * 1024};
     std::string m_role = "idle";
     std::string m_pendingClipboardTarget;
     std::string m_lastSentClipboardText;

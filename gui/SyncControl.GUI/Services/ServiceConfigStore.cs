@@ -43,6 +43,9 @@ public sealed class ServiceConfig
 
     [JsonPropertyName("dwellMs")]
     public int DwellMs { get; set; } = 500;
+
+    [JsonPropertyName("clipboardConfirmThresholdMb")]
+    public int ClipboardConfirmThresholdMb { get; set; } = 10;
 }
 
 public static class ServiceConfigStore
