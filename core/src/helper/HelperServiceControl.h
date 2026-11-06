@@ -15,6 +15,9 @@ class HelperServiceControl {
 public:
     static bool install(std::string& error);
     static bool uninstall(std::string& error);
+    // Stops the service without deleting it; used when core exits so the
+    // idle SYSTEM helper does not linger.
+    static bool uninstallForStop();
     static bool isInstalled();
     static bool isRunning();
 };

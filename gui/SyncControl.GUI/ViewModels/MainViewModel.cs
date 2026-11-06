@@ -32,9 +32,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private readonly CancellationTokenSource _monitorCts = new();
     private readonly HashSet<string> _connectedPeerIds = new(StringComparer.OrdinalIgnoreCase);
     private readonly Task _monitorTask;
-    private CancellationTokenSource? _layoutUpdateCts;
     private string _lastTransferFileName = string.Empty;
-    private bool _settingsOpen;
     private bool _serviceStopping;
 
     [ObservableProperty]
@@ -135,27 +133,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     private bool _helperServiceBusy;
 
     [ObservableProperty]
-    private bool _manualKcp;
-
-    [ObservableProperty]
-    private bool _kcpNodelay = true;
-
-    [ObservableProperty]
-    private int _kcpInterval = 10;
-
-    [ObservableProperty]
-    private int _kcpResend = 2;
-
-    [ObservableProperty]
-    private bool _kcpNoCongestion = true;
-
-    [ObservableProperty]
-    private int _kcpSendWindow = 128;
-
-    [ObservableProperty]
-    private int _kcpReceiveWindow = 128;
-
-    [ObservableProperty]
     private string _switchMode = "immediate";
 
     [ObservableProperty]
@@ -190,7 +167,13 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
     public ObservableCollection<EdgeHighlight> Highlights { get; } = [];
 
-    public string LayoutFilePath { get; } = Path.Combine(AppContext.BaseDirectory, "layout.json");
+    // Single source of truth for the master layout. The Core reads this same
+    // file when restoring its service at boot, so saving the canvas keeps the
+    // Core's restore state in sync without a separate snapshot.
+    public string LayoutFilePath { get; } = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "SyncControl",
+        "master-layout.json");
 
     public bool IsMasterRole
     {
@@ -279,7 +262,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         if (ShowNodeEditor(node, isNew: false))
         {
             RebuildRouting();
-            SaveLayout();
         }
     }
 
@@ -294,23 +276,90 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         Screens.Remove(node);
         _connectedPeerIds.Remove(node.Id);
         RebuildRouting();
-        SaveLayout();
     }
 
+    // The single entry point that persists anything: service config, layout,
+    // autostart registration and the live push to a running Core all happen
+    // here and nowhere else.
     [RelayCommand]
-    private void SaveLayout()
+    private async Task SaveAllAsync()
     {
         try
         {
-            var config = RoutingBuilder.Build(Screens).Layout;
-            File.WriteAllText(LayoutFilePath, JsonSerializer.Serialize(config, JsonOptions), Encoding.UTF8);
-            StatusText = "布局已保存";
+            var directory = Path.GetDirectoryName(LayoutFilePath);
+            if (!string.IsNullOrEmpty(directory))
+            {
+                Directory.CreateDirectory(directory);
+            }
+            var layout = RoutingBuilder.Build(Screens).Layout;
+            // UTF-8 without BOM: the Core parses this same file and nlohmann
+            // would choke on a BOM.
+            File.WriteAllText(LayoutFilePath, JsonSerializer.Serialize(layout, JsonOptions),
+                new UTF8Encoding(false));
         }
         catch (Exception error)
         {
-            StatusText = $"保存布局失败: {error.Message}";
+            StatusText = $"保存失败: 无法写入布局 ({error.Message})";
             FileLogger.Error("save layout failed", error);
+            return;
         }
+
+        try
+        {
+            ServiceConfigStore.Save(new ServiceConfig
+            {
+                Role = SelectedRole,
+                BindIp = BindIp,
+                Port = Port,
+                MasterIp = MasterIp.Trim(),
+                MasterPort = MasterPort,
+                SlavePort = SlavePort,
+                SecurityKey = SecurityKey,
+                AutoStart = AutostartEnabled,
+                SwitchMode = SwitchMode,
+                BumpWindowMs = BumpWindowMs,
+                BumpCount = BumpCount,
+                DwellMs = DwellMs,
+                ClipboardConfirmThresholdMb = ClipboardConfirmThresholdMb,
+            });
+        }
+        catch (Exception error)
+        {
+            StatusText = $"保存失败: 无法写入服务配置 ({error.Message})";
+            FileLogger.Error("save service config failed", error);
+            return;
+        }
+
+        AutostartManager.SetEnabled(AutostartEnabled, slaveMode: SelectedRole == "slave");
+
+        if (IsRunning)
+        {
+            await PushToRunningCoreAsync();
+        }
+
+        StatusText = "配置已保存";
+        FileLogger.Info("all config saved");
+    }
+
+    private async Task PushToRunningCoreAsync()
+    {
+        var switchResponse = await _ipc.SendAsync(BuildSwitchPolicyCommand());
+        var thresholdResponse = await _ipc.SendAsync(new JsonObject
+        {
+            ["type"] = "set_clipboard_confirm_threshold",
+            ["clipboardConfirmThresholdBytes"] = (long)Math.Max(0, ClipboardConfirmThresholdMb) * 1024 * 1024,
+        });
+        if (Role == "master")
+        {
+            var layout = RoutingBuilder.Build(Screens).Layout;
+            await _ipc.SendAsync(new JsonObject
+            {
+                ["type"] = "update_layout",
+                ["layout"] = JsonNode.Parse(JsonSerializer.Serialize(layout, JsonOptions)),
+            });
+        }
+        FileLogger.Info($"live push done (switch {(switchResponse.Success ? "ok" : "rejected")}, " +
+                        $"threshold {(thresholdResponse.Success ? "ok" : "rejected")})");
     }
 
     [RelayCommand]
@@ -327,11 +376,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
     private async Task StartServiceAsync()
     {
-        PersistServiceConfig();
-        if (SelectedRole == "master" && !PersistMasterLayoutForCore())
-        {
-            return;
-        }
         StatusText = "正在启动控制...";
 
         if (!await _serviceManager.StartAsync(SelectedRole))
@@ -399,29 +443,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         return false;
     }
 
-    private bool PersistMasterLayoutForCore()
-    {
-        try
-        {
-            var directory = Path.Combine(
-                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "SyncControl");
-            Directory.CreateDirectory(directory);
-            var layout = RoutingBuilder.Build(Screens).Layout;
-            File.WriteAllText(
-                Path.Combine(directory, "master-layout.json"),
-                JsonSerializer.Serialize(layout, JsonOptions),
-                new UTF8Encoding(false));
-            return true;
-        }
-        catch (Exception error)
-        {
-            StatusText = $"启动失败: 无法保存 Core 布局 ({error.Message})";
-            FileLogger.Error("persist core master layout failed", error);
-            return false;
-        }
-    }
-
     [RelayCommand]
     private async Task RestartServiceAsync()
     {
@@ -446,13 +467,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             return;
         }
 
-        PersistServiceConfig();
-        if (SelectedRole == "master" && !PersistMasterLayoutForCore())
-        {
-            IsServiceError = true;
-            return;
-        }
-
         if (!await WaitForCoreServiceAsync())
         {
             _serviceManager.Stop();
@@ -468,12 +482,11 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         StatusText = "服务已重启";
     }
 
+    // In-memory only; the scheduled task is created or removed when the user
+    // clicks Save.
     public void SetAutostart(bool enabled)
     {
         AutostartEnabled = enabled;
-        AutostartManager.SetEnabled(enabled, slaveMode: SelectedRole == "slave");
-        PersistServiceConfig();
-        FileLogger.Info($"autostart {(enabled ? "enabled" : "disabled")}");
     }
 
     private void LoadServiceConfig()
@@ -498,64 +511,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         AutostartEnabled = AutostartManager.IsEnabled(slaveMode: SelectedRole == "slave");
     }
 
-    private void PersistServiceConfig()
-    {
-        ServiceConfigStore.Save(new ServiceConfig
-        {
-            Role = SelectedRole,
-            BindIp = BindIp,
-            Port = Port,
-            MasterIp = MasterIp.Trim(),
-            MasterPort = MasterPort,
-            SlavePort = SlavePort,
-            SecurityKey = SecurityKey,
-            AutoStart = AutostartEnabled,
-            SwitchMode = SwitchMode,
-            BumpWindowMs = BumpWindowMs,
-            BumpCount = BumpCount,
-            DwellMs = DwellMs,
-            ClipboardConfirmThresholdMb = ClipboardConfirmThresholdMb,
-        });
-        if (AutostartEnabled)
-        {
-            // Keep the registered Core arguments in sync with the selected role.
-            AutostartManager.SetEnabled(true, slaveMode: SelectedRole == "slave");
-        }
-    }
-
-    [RelayCommand]
-    private async Task ToggleHelperServiceAsync()
-    {
-        if (HelperServiceBusy)
-        {
-            return;
-        }
-        HelperServiceBusy = true;
-        try
-        {
-            var type = HelperServiceInstalled ? "uninstall_helper_service" : "install_helper_service";
-            var response = await _ipc.SendAsync(new JsonObject { ["type"] = type });
-            if (response.Success && response.Response?["type"]?.GetValue<string>() == "ok")
-            {
-                HelperServiceInstalled = !HelperServiceInstalled;
-                StatusText = HelperServiceInstalled
-                    ? "UAC 控制服务已安装"
-                    : "UAC 控制服务已卸载";
-                FileLogger.Info($"helper service {type} ok");
-            }
-            else
-            {
-                var message = response.Response?["message"]?.GetValue<string>() ?? "未知错误";
-                StatusText = $"UAC 控制服务操作失败: {message}";
-                FileLogger.Error($"helper service {type} failed: {message}");
-            }
-        }
-        finally
-        {
-            HelperServiceBusy = false;
-        }
-    }
-
     private void ResetServiceState()
     {
         IsRunning = false;
@@ -568,7 +523,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
     public void Dispose()
     {
-        _layoutUpdateCts?.Cancel();
         _monitorCts.Cancel();
         try
         {
@@ -652,10 +606,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             nameof(ScreenNode.Width) or nameof(ScreenNode.Height))
         {
             RebuildRouting();
-            if (IsRunning)
-            {
-                QueueLayoutUpdate();
-            }
         }
     }
 
@@ -730,33 +680,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             {
                 dragged.X = bestValue;
             }
-        }
-    }
-
-    private void QueueLayoutUpdate()
-    {
-        _layoutUpdateCts?.Cancel();
-        _layoutUpdateCts?.Dispose();
-        _layoutUpdateCts = new CancellationTokenSource();
-        var token = _layoutUpdateCts.Token;
-        _ = SendLayoutUpdateAfterDelayAsync(token);
-    }
-
-    private async Task SendLayoutUpdateAfterDelayAsync(CancellationToken cancellationToken)
-    {
-        try
-        {
-            await Task.Delay(300, cancellationToken);
-            var layout = RoutingBuilder.Build(Screens).Layout;
-            var command = new JsonObject
-            {
-                ["type"] = "update_layout",
-                ["layout"] = JsonNode.Parse(JsonSerializer.Serialize(layout, JsonOptions)),
-            };
-            await _ipc.SendAsync(command, cancellationToken);
-        }
-        catch (OperationCanceledException)
-        {
         }
     }
 
@@ -847,8 +770,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             StatusText = $"{unconfiguredIp}已上线，请进行布局配置";
         }
         UpdateNetworkStatus(status["network"] as JsonObject);
-        HelperServiceInstalled = status["helper"]?["serviceInstalled"]?.GetValue<bool>()
-                                 ?? HelperServiceInstalled;
     }
 
     private void EnsureLayoutNode(string peerId, string peerIp)
@@ -876,7 +797,7 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         else
         {
             // Keep the layout id/ip aligned with the live peer so the Core's
-            // layoutConfigured check matches after the next update_layout.
+            // layoutConfigured check matches after the next saved update_layout.
             node.Id = peerId;
             if (!string.IsNullOrEmpty(peerIp))
             {
@@ -884,7 +805,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
             }
         }
         RebuildRouting();
-        SaveLayout();
     }
 
     private void UpdateNetworkStatus(JsonObject? network)
@@ -922,45 +842,11 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         {
             MouseLossText = "鼠标丢包率：--";
         }
-
-        if (!_settingsOpen)
-        {
-            ManualKcp = networkStatus["manualKcp"]?.GetValue<bool>() ?? false;
-            KcpNodelay = (kcp?["nodelay"]?.GetValue<int>() ?? 1) != 0;
-            KcpInterval = kcp?["interval"]?.GetValue<int>() ?? 10;
-            KcpResend = kcp?["resend"]?.GetValue<int>() ?? 2;
-            KcpNoCongestion = (kcp?["nc"]?.GetValue<int>() ?? 1) != 0;
-            KcpSendWindow = kcp?["sendWindow"]?.GetValue<int>() ?? 128;
-            KcpReceiveWindow = kcp?["receiveWindow"]?.GetValue<int>() ?? 128;
-        }
-    }
-
-    public void SetSettingsOpen(bool isOpen)
-    {
-        _settingsOpen = isOpen;
-    }
-
-    [RelayCommand]
-    private async Task ApplyKcpParametersAsync()
-    {
-        var response = await _ipc.SendAsync(new JsonObject
-        {
-            ["type"] = "set_kcp_params",
-            ["nodelay"] = KcpNodelay ? 1 : 0,
-            ["interval"] = KcpInterval,
-            ["resend"] = KcpResend,
-            ["nc"] = KcpNoCongestion ? 1 : 0,
-            ["sendWindow"] = KcpSendWindow,
-            ["receiveWindow"] = KcpReceiveWindow,
-        });
-        StatusText = response.Success ? "KCP 参数已应用" : "KCP 参数无效";
-        FileLogger.Info($"manual KCP parameters {(response.Success ? "accepted" : "rejected")}");
     }
 
     [RelayCommand]
     private async Task ApplySwitchPolicyAsync()
     {
-        PersistServiceConfig();
         var response = await _ipc.SendAsync(BuildSwitchPolicyCommand());
         StatusText = response.Success ? "切换策略已应用" : "切换策略无效";
         FileLogger.Info($"switch policy {(response.Success ? "accepted" : "rejected")}: {SwitchMode}");
@@ -981,7 +867,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
     [RelayCommand]
     private async Task ApplyClipboardConfirmThresholdAsync()
     {
-        PersistServiceConfig();
         var thresholdMb = Math.Max(0, ClipboardConfirmThresholdMb);
         var response = await _ipc.SendAsync(new JsonObject
         {
@@ -990,6 +875,147 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
         });
         StatusText = response.Success ? "剪贴板同步设置已应用" : "剪贴板同步设置无效";
         FileLogger.Info($"clipboard confirm threshold {(response.Success ? "accepted" : "rejected")}: {thresholdMb} MB");
+    }
+
+    [RelayCommand]
+    private async Task ClearConfigAsync()
+    {
+        var owner = Application.Current?.Windows.OfType<Window>().FirstOrDefault(window => window.IsActive);
+        var confirmed = MessageBox.Show(
+            owner,
+            "将清除 SyncControl 的所有配置和数据：\n\n" +
+            "· 服务配置、主控/被控端布局、安全密钥\n" +
+            "· 剪贴板临时文件和所有日志\n" +
+            "· 开机自启动计划和 Helper 服务\n\n" +
+            "清除后需要重启本程序。确定继续吗？",
+            "清除配置",
+            MessageBoxButton.YesNo,
+            MessageBoxImage.Warning,
+            MessageBoxResult.No);
+        if (confirmed != MessageBoxResult.Yes)
+        {
+            return;
+        }
+
+        StatusText = "正在清除配置...";
+        FileLogger.Info("clearing all config requested");
+
+        // Stop the Core first so it stops rewriting the files being deleted.
+        if (IsRunning)
+        {
+            _serviceStopping = true;
+            try
+            {
+                await _ipc.SendAsync(new JsonObject { ["type"] = "exit" });
+                await _serviceManager.StopAsync();
+                ResetServiceState();
+            }
+            finally
+            {
+                _serviceStopping = false;
+            }
+        }
+
+        var failures = AutostartManager.ClearAll();
+        failures.AddRange(DeleteConfigFiles());
+
+        ResetViewModelState();
+        StatusText = failures.Count == 0
+            ? "配置已全部清除，请重启本程序"
+            : $"配置清除完成，但部分项目失败：{string.Join("；", failures)}（请重启本程序）";
+        FileLogger.Info(failures.Count == 0
+            ? "all config cleared"
+            : $"config clear finished with failures: {string.Join("; ", failures)}");
+
+        MessageBox.Show(
+            owner,
+            failures.Count == 0
+                ? "所有配置已清除。请关闭并重新打开本程序以恢复默认状态。"
+                : "配置已清除，但以下项目失败：\n" + string.Join("\n", failures) +
+                  "\n\n请关闭并重新打开本程序。",
+            "清除配置",
+            MessageBoxButton.OK,
+            failures.Count == 0 ? MessageBoxImage.Information : MessageBoxImage.Warning);
+    }
+
+    private static IEnumerable<string> DeleteConfigFiles()
+    {
+        var failures = new List<string>();
+        DeleteDirectory(
+            Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "SyncControl"),
+            "本地配置目录", failures);
+        DeleteDirectory(
+            Path.Combine(Path.GetTempPath(), "SyncControl"),
+            "临时目录日志", failures);
+        DeleteDirectory(
+            "C:\\ProgramData\\SyncControl",
+            "ProgramData 日志", failures);
+        DeleteFile(
+            Path.Combine(AppContext.BaseDirectory, "layout.json"),
+            "旧版 GUI 布局文件", failures);
+        return failures;
+    }
+
+    private static void DeleteDirectory(string path, string label, List<string> failures)
+    {
+        try
+        {
+            if (!Directory.Exists(path))
+            {
+                return;
+            }
+            Directory.Delete(path, recursive: true);
+            FileLogger.Info($"deleted {label}: {path}");
+        }
+        catch (Exception error)
+        {
+            FileLogger.Error($"delete {label} failed", error);
+            failures.Add($"{label}({path})");
+        }
+    }
+
+    private static void DeleteFile(string path, string label, List<string> failures)
+    {
+        try
+        {
+            if (!File.Exists(path))
+            {
+                return;
+            }
+            File.Delete(path);
+            FileLogger.Info($"deleted {label}: {path}");
+        }
+        catch (Exception error)
+        {
+            FileLogger.Error($"delete {label} failed", error);
+            failures.Add($"{label}({path})");
+        }
+    }
+
+    private void ResetViewModelState()
+    {
+        SelectedRole = "master";
+        BindIp = "0.0.0.0";
+        Port = 19881;
+        MasterIp = string.Empty;
+        MasterPort = 19881;
+        SlavePort = 19881;
+        SecurityKey = string.Empty;
+        SwitchMode = "immediate";
+        BumpWindowMs = 1000;
+        BumpCount = 2;
+        DwellMs = 500;
+        ClipboardConfirmThresholdMb = 10;
+        AutostartEnabled = false;
+
+        foreach (var node in Screens.Where(item => !item.IsMaster).ToArray())
+        {
+            node.PropertyChanged -= OnScreenPropertyChanged;
+            Screens.Remove(node);
+        }
+        RebuildRouting();
     }
 
     private static string KcpFlagText(JsonNode? value)
@@ -1155,11 +1181,6 @@ public sealed partial class MainViewModel : ObservableObject, IDisposable
 
         node.ScreenW = width;
         node.ScreenH = height;
-        if (IsRunning)
-        {
-            QueueLayoutUpdate();
-        }
-        SaveLayout();
     }
 
     private static TextBlock CreateLabel(string text)

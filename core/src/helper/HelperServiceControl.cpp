@@ -142,6 +142,36 @@ bool HelperServiceControl::uninstall(std::string& error) {
     return true;
 }
 
+bool HelperServiceControl::uninstallForStop() {
+    SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
+    if (manager == nullptr) {
+        return false;
+    }
+    const SC_HANDLE service = OpenServiceW(
+        manager, kServiceName, SERVICE_STOP | SERVICE_QUERY_STATUS);
+    CloseServiceHandle(manager);
+    if (service == nullptr) {
+        return true;  // not installed: nothing to stop
+    }
+    SERVICE_STATUS status{};
+    if (!QueryServiceStatus(service, &status) ||
+        status.dwCurrentState == SERVICE_STOPPED) {
+        CloseServiceHandle(service);
+        return true;
+    }
+    ControlService(service, SERVICE_CONTROL_STOP, &status);
+    for (int waitedMs = 0; waitedMs < 15000; waitedMs += 100) {
+        if (!QueryServiceStatus(service, &status) ||
+            status.dwCurrentState == SERVICE_STOPPED) {
+            break;
+        }
+        Sleep(100);
+    }
+    CloseServiceHandle(service);
+    Logger::write("helper: service stopped after core exit");
+    return true;
+}
+
 bool HelperServiceControl::isInstalled() {
     SC_HANDLE manager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
     if (manager == nullptr) {

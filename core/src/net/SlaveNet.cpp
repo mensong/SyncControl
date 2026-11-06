@@ -122,8 +122,8 @@ bool SlaveNet::start(uint16_t localPort, const std::string& masterIp, uint16_t m
     // independently of master reachability (and of whether masterIp is a
     // resolvable address at all).
     m_input.startHelperConnection();
-    if (InetPtonA(AF_INET, masterIp.c_str(), &m_masterEndpoint.sin_addr) != 1) {
-        Logger::write("slave: invalid master IP " + masterIp);
+    if (!resolveHostIpv4(masterIp, m_masterEndpoint.sin_addr)) {
+        Logger::write("slave: cannot resolve master address " + masterIp);
         m_masterEndpoint = {};
         m_running = m_socket.bind(localPort);
         return m_running;

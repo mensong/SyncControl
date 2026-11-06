@@ -1,6 +1,5 @@
 using System.Diagnostics;
 using System.IO;
-using System.Security.Principal;
 using System.Xml.Linq;
 using Microsoft.Win32;
 
@@ -11,6 +10,7 @@ public static class AutostartManager
     private const string RunKeyPath = @"Software\Microsoft\Windows\CurrentVersion\Run";
     private const string AppName = "SyncControl";
     private const string TaskName = @"SyncControl\SyncControlCore";
+    private const string HelperServiceName = "SyncControlHelper";
     private const string TaskNamespace = "http://schemas.microsoft.com/windows/2004/02/mit/task";
 
     public static bool IsEnabled(bool slaveMode)
@@ -54,6 +54,111 @@ public static class AutostartManager
         {
             FileLogger.Error("autostart toggle failed", error);
         }
+    }
+
+    // One-click config reset: remove the autostart task, the legacy Run entry
+    // and the Helper Windows service. Returns what failed so the caller can
+    // report leftovers instead of silently claiming a clean slate.
+    public static List<string> ClearAll()
+    {
+        var failures = new List<string>();
+        try
+        {
+            if (RunSchtasks($"/Delete /TN \"{TaskName}\" /F", out var output))
+            {
+                FileLogger.Info("autostart: deleted scheduled task");
+            }
+            else if (output.Contains("does not exist", StringComparison.OrdinalIgnoreCase) ||
+                     output.Contains("找不到", StringComparison.Ordinal))
+            {
+                FileLogger.Info("autostart: no scheduled task to delete");
+            }
+            else
+            {
+                failures.Add($"计划任务删除失败: {output}");
+            }
+        }
+        catch (Exception error)
+        {
+            FileLogger.Error("autostart: scheduled task delete failed", error);
+            failures.Add($"计划任务删除失败: {error.Message}");
+        }
+
+        try
+        {
+            RemoveLegacyRunEntry();
+        }
+        catch (Exception error)
+        {
+            FileLogger.Error("autostart: legacy run entry delete failed", error);
+            failures.Add($"自启动注册表清理失败: {error.Message}");
+        }
+
+        var helper = UninstallHelperService();
+        if (helper is not null)
+        {
+            failures.Add(helper);
+        }
+
+        return failures;
+    }
+
+    // Runs `sc.exe stop` + `sc.exe delete` on the Helper service, mirroring
+    // HelperServiceControl::uninstall on the Core side. Null on success.
+    private static string? UninstallHelperService()
+    {
+        try
+        {
+            if (!RunSc($"stop {HelperServiceName}", out var output))
+            {
+                FileLogger.Info($"helper service stop: {output}");
+            }
+
+            if (RunSc($"delete {HelperServiceName}", out output))
+            {
+                FileLogger.Info("helper service deleted");
+                return null;
+            }
+
+            if (output.Contains("1060") || output.Contains("does not exist", StringComparison.OrdinalIgnoreCase))
+            {
+                FileLogger.Info("helper service not installed");
+                return null;
+            }
+
+            return $"Helper 服务卸载失败: {output}";
+        }
+        catch (Exception error)
+        {
+            FileLogger.Error("helper service uninstall failed", error);
+            return $"Helper 服务卸载失败: {error.Message}";
+        }
+    }
+
+    private static bool RunSc(string arguments, out string output)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = Path.Combine(Environment.SystemDirectory, "sc.exe"),
+            Arguments = arguments,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+        };
+
+        using var process = Process.Start(startInfo);
+        if (process is null)
+        {
+            output = "sc.exe failed to start";
+            return false;
+        }
+
+        var stdout = process.StandardOutput.ReadToEnd();
+        var stderr = process.StandardError.ReadToEnd();
+        process.WaitForExit();
+        output = (stdout + stderr).Trim();
+        return process.ExitCode == 0;
     }
 
     private static bool TryCreateTask(bool slaveMode)
@@ -145,7 +250,8 @@ public static class AutostartManager
 
     private static string BuildTaskXml(string corePath, bool slaveMode)
     {
-        var identity = WindowsIdentity.GetCurrent();
+        // schtasks rejects SID-form UserIds in the Principal element
+        // ("任务 XML 包含格式不正确或超出范围的值"), so use DOMAIN\name form.
         var account = $"{Environment.UserDomainName}\\{Environment.UserName}";
         var arguments = slaveMode ? "--slave" : "--master";
 
@@ -159,7 +265,7 @@ public static class AutostartManager
               </Triggers>
               <Principals>
                 <Principal id="Author">
-                  <UserId>{identity.User?.Value}</UserId>
+                  <UserId>{account}</UserId>
                   <LogonType>InteractiveToken</LogonType>
                   <RunLevel>Highest</RunLevel>
                 </Principal>

@@ -65,8 +65,8 @@ public partial class LayoutCanvas : UserControl
 
         if (DataContext is MainViewModel viewModel)
         {
+            // In-memory only; the layout reaches disk and the Core via Save.
             viewModel.SnapToEdges(_draggedNode);
-            viewModel.SaveLayoutCommand.Execute(null);
         }
         EndDrag(sender);
         e.Handled = true;

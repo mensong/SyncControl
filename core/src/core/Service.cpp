@@ -782,10 +782,11 @@ bool Service::startSlave(uint16_t localPort, const std::string& masterIp,
     if (started) {
         m_role = "slave";
         // Slave mode injects input, so the UAC helper service must be in
-        // place. Install+start is idempotent; failure only means UAC prompts
-        // fall back to local inject, which the log records.
+        // place. install() is idempotent across all three states (not
+        // installed / installed but stopped / already running); skipping it
+        // when the registration exists would leave a stopped service down.
         std::string helperError;
-        if (!HelperServiceControl::isInstalled() && !HelperServiceControl::install(helperError)) {
+        if (!HelperServiceControl::install(helperError)) {
             Logger::write("slave: helper service auto-install failed: " + helperError);
         }
         Logger::write("slave: started on port " + std::to_string(localPort) +
@@ -842,6 +843,10 @@ void Service::onSecureDesktopChangedStatic(bool secure) {
 
 void Service::stopMode() {
     Logger::write("service: mode stopped");
+    // The UAC helper is only useful while slave injection is active. Stopping
+    // here covers both mode switches and process exit (stopMode runs in the
+    // destructor too), so the SYSTEM helper never lingers idle.
+    HelperServiceControl::uninstallForStop();
     if (m_fileTransfer) {
         m_fileTransfer->setReceiveCompletedHandler(nullptr);
     }
@@ -2101,19 +2106,6 @@ nlohmann::json Service::handleIpc(const nlohmann::json& command) {
         Logger::write("service: manual KCP parameters applied");
         return {{"type", "ok"}, {"accepted", type}};
     }
-    if (type == "install_helper_service" || type == "uninstall_helper_service") {
-        std::string error;
-        const bool install = type == "install_helper_service";
-        const bool ok = install ? HelperServiceControl::install(error)
-                                : HelperServiceControl::uninstall(error);
-        Logger::write(std::string("service: helper service ") +
-                      (install ? "install" : "uninstall") +
-                      (ok ? " succeeded" : " failed: " + error));
-        if (!ok) {
-            return {{"type", "error"}, {"message", error}};
-        }
-        return {{"type", "ok"}, {"accepted", type}};
-    }
     if (type == "start_master" || type == "start_slave" || type == "stop" ||
         type == "update_layout" || type == "set_switch_policy" ||
         type == "set_clipboard_confirm_threshold" || type == "exit") {
@@ -2205,8 +2197,6 @@ nlohmann::json Service::getStatusLocked() {
         // the configured empty-key mode would break on the next GUI refresh.
         {"keyConfigured", !SecurityKeyStore::load().empty()},
     };
-    status["helper"] = {{"serviceInstalled", HelperServiceControl::isInstalled()},
-                        {"serviceRunning", HelperServiceControl::isRunning()}};
 
     std::string clipboardState = "empty";
     if (m_clipboard) {
