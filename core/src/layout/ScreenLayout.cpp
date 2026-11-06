@@ -10,24 +10,6 @@ namespace {
 
 constexpr float kRangeEpsilon = 1e-4f;
 
-bool parseRect(const nlohmann::json& value, Rect& out) {
-    if (!value.is_object()) {
-        return false;
-    }
-    const char* numberKeys[] = {"x", "y", "width", "height"};
-    for (const char* key : numberKeys) {
-        const auto item = value.find(key);
-        if (item != value.end() && !item->is_null() && !item->is_number()) {
-            return false;
-        }
-    }
-    out.x = value.value("x", 0);
-    out.y = value.value("y", 0);
-    out.width = value.value("width", 0);
-    out.height = value.value("height", 0);
-    return true;
-}
-
 }  // namespace
 
 bool edgeFromString(const std::string& name, Edge& out) {
@@ -125,10 +107,6 @@ bool ScreenLayout::loadFromJson(const nlohmann::json& layout) {
         node.port = static_cast<uint16_t>(entry.value("port", 19881));
         node.screenW = entry.value("screenW", 0);
         node.screenH = entry.value("screenH", 0);
-        const auto rectIt = entry.find("layoutRect");
-        if (rectIt != entry.end() && !parseRect(*rectIt, node.layoutRect)) {
-            return false;
-        }
         if (node.id.empty() || node.screenW < 0 || node.screenH < 0) {
             return false;
         }
@@ -205,59 +183,6 @@ bool ScreenLayout::loadFromJson(const nlohmann::json& layout) {
     return true;
 }
 
-nlohmann::json ScreenLayout::toJson() const {
-    std::vector<ScreenNode> nodes;
-    std::vector<ScreenRouting> routings;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        nodes = m_nodes;
-        routings = m_routings;
-    }
-
-    nlohmann::json result;
-    nlohmann::json screens = nlohmann::json::array();
-    for (const ScreenNode& node : nodes) {
-        nlohmann::json entry = {
-            {"id", node.id},
-            {"hostname", node.hostname},
-            {"ip", node.ip},
-            {"port", node.port},
-            {"screenW", node.screenW},
-            {"screenH", node.screenH},
-        };
-        if (node.layoutRect.width > 0 && node.layoutRect.height > 0) {
-            entry["layoutRect"] = {
-                {"x", node.layoutRect.x},
-                {"y", node.layoutRect.y},
-                {"width", node.layoutRect.width},
-                {"height", node.layoutRect.height},
-            };
-        }
-        screens.push_back(std::move(entry));
-    }
-    result["screens"] = std::move(screens);
-
-    nlohmann::json routing = nlohmann::json::object();
-    for (const ScreenRouting& screen : routings) {
-        nlohmann::json edges = nlohmann::json::object();
-        for (int edgeIndex = 0; edgeIndex < 4; ++edgeIndex) {
-            nlohmann::json segments = nlohmann::json::array();
-            for (const EdgeSegment& segment : screen.segments[edgeIndex]) {
-                segments.push_back({
-                    {"rangeStart", segment.rangeStart},
-                    {"rangeEnd", segment.rangeEnd},
-                    {"toId", segment.toId},
-                    {"toEdge", edgeToString(segment.toEdge)},
-                });
-            }
-            edges[edgeToString(static_cast<Edge>(edgeIndex))] = std::move(segments);
-        }
-        routing[screen.screenId] = std::move(edges);
-    }
-    result["routing"] = std::move(routing);
-    return result;
-}
-
 bool ScreenLayout::loadFromFile(const std::string& path) {
     std::ifstream file(path);
     if (!file) {
@@ -270,15 +195,6 @@ bool ScreenLayout::loadFromFile(const std::string& path) {
         return false;
     }
     return loadFromJson(layout);
-}
-
-bool ScreenLayout::saveToFile(const std::string& path) const {
-    std::ofstream file(path);
-    if (!file) {
-        return false;
-    }
-    file << toJson().dump(2) << '\n';
-    return file.good();
 }
 
 void ScreenLayout::clear() {

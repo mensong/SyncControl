@@ -149,16 +149,8 @@ std::string savedMasterLayoutPath() {
     return directory + "\\master-layout.json";
 }
 
-void persistMasterLayout(const ScreenLayout& layout) {
-    const std::string path = savedMasterLayoutPath();
-    if (path.empty()) {
-        Logger::write("master: cannot resolve saved layout path");
-        return;
-    }
-    if (!layout.saveToFile(path)) {
-        Logger::write("master: failed to save layout for restore");
-    }
-}
+// The GUI is the sole writer of master-layout.json; the Core only reads it
+// (startSavedMaster) so its JSON shape stays exactly what the GUI parses.
 
 // Rich-content transfers below this size skip the confirm window; 0 means
 // always ask.
@@ -695,7 +687,6 @@ bool Service::startMasterWithLayout(const ScreenLayout& layout, const std::strin
         return gateRemotePaste(metadata);
     });
     Logger::write("master: started with " + std::to_string(peerInits.size()) + " peers");
-    persistMasterLayout(layout);
     return true;
 }
 
@@ -1354,6 +1345,15 @@ void Service::handleRemoteImageBatch(const std::string& sourceId,
                   ", transferId=" + meta.transferId +
                   ", bytes=" + std::to_string(meta.totalBytes));
     if (offer.created) {
+        const uint64_t threshold = clipboardConfirmThresholdBytes();
+        if (threshold > 0 && meta.totalBytes <= threshold) {
+            // Small transfers skip the confirm window entirely.
+            Logger::write("clipboard: remote image auto-confirmed, task=" +
+                          std::to_string(offer.taskId) + ", bytes=" +
+                          std::to_string(meta.totalBytes));
+            m_transferQueue->confirm(offer.taskId);
+            return;
+        }
         m_pendingConfirmTaskId = offer.taskId;
         m_pendingConfirmOrigin = meta.originPeerId;
         m_pendingConfirmSequence = meta.originClipboardSequence;
@@ -1966,7 +1966,6 @@ bool Service::updateLayout(const nlohmann::json& layoutJson) {
         m_layout = std::move(layout);
         m_masterScreenId = masterId;
     }
-    persistMasterLayout(m_layout);
     return true;
 }
 

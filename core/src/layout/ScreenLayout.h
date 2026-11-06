@@ -16,13 +16,6 @@ enum class Edge {
     Right,
 };
 
-struct Rect {
-    int x = 0;
-    int y = 0;
-    int width = 0;
-    int height = 0;
-};
-
 struct ScreenNode {
     std::string id;
     std::string hostname;
@@ -30,7 +23,6 @@ struct ScreenNode {
     uint16_t port = 19881;
     int screenW = 0;
     int screenH = 0;
-    Rect layoutRect{};
 };
 
 struct EdgeSegment {
@@ -58,9 +50,7 @@ public:
     // Replaces the whole layout only when the JSON is fully valid, so a bad
     // hot update never leaves a half-parsed routing table behind.
     bool loadFromJson(const nlohmann::json& layout);
-    nlohmann::json toJson() const;
     bool loadFromFile(const std::string& path);
-    bool saveToFile(const std::string& path) const;
     void clear();
 
     std::vector<ScreenNode> nodes() const;
